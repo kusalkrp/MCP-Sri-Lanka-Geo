@@ -9,7 +9,7 @@ Transports:
 Startup order:
     1. Init asyncpg pool (postgis.init_pool)
     2. Init Redis client (redis_cache.init_redis)
-    3. Register MCP tools
+    3. Init Qdrant client + configure Gemini (qdrant_client.init_qdrant)
     4. Mount MCP SSE handler on /sse
     5. Serve
 
@@ -21,13 +21,17 @@ Auth rules:
 
 from __future__ import annotations
 
+import secrets
 import sys
+from contextlib import asynccontextmanager
 
+import anyio
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
+from mcp.server.sse import SseServerTransport
 
 from app.cache import redis_cache
 from app.config import settings
@@ -45,29 +49,43 @@ mcp = FastMCP(
 
 register_tools(mcp)
 
+
+# ── Lifespan (replaces deprecated @app.on_event) ─────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await postgis.init_pool()
+    await redis_cache.init_redis()
+    await qdrant_mod.init_qdrant()   # also configures Gemini API key
+    log.info("app_startup_complete", version=settings.app_version)
+    yield
+    await postgis.close_pool()
+    await redis_cache.close_redis()
+    await qdrant_mod.close_qdrant()
+    log.info("app_shutdown_complete")
+
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
     title="MCP Sri Lanka Geo",
     version=settings.app_version,
     docs_url=None,   # disable in prod — no public swagger
     redoc_url=None,
+    lifespan=lifespan,
 )
 
-
-@app.on_event("startup")
-async def startup() -> None:
-    await postgis.init_pool()
-    await redis_cache.init_redis()
-    await qdrant_mod.init_qdrant()
-    log.info("app_startup_complete", version=settings.app_version)
+# ── Body size limit middleware ────────────────────────────────────────────────
+# MCP JSON-RPC messages are small. 1MB is generous; blocks oversized abuse before
+# the body is read into memory.
+_MAX_BODY_BYTES = 1 * 1024 * 1024  # 1MB
 
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    await postgis.close_pool()
-    await redis_cache.close_redis()
-    await qdrant_mod.close_qdrant()
-    log.info("app_shutdown_complete")
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > _MAX_BODY_BYTES:
+        return JSONResponse({"error": "Request body too large"}, status_code=413)
+    return await call_next(request)
 
 
 # ── Health endpoint ───────────────────────────────────────────────────────────
@@ -119,8 +137,12 @@ async def health() -> JSONResponse:
 
 # ── SSE transport — ALWAYS requires auth ─────────────────────────────────────
 
+# SseServerTransport handles the SSE <-> MCP protocol bridge.
+# Messages are posted to /messages/ (trailing slash is part of the mount path).
+_sse_transport = SseServerTransport("/messages/")
+
+
 def _verify_api_key(provided: str) -> bool:
-    import secrets
     return any(
         secrets.compare_digest(provided, valid)
         for valid in settings.api_keys_list
@@ -134,14 +156,41 @@ async def sse_endpoint(request: Request):
     if not _verify_api_key(api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    # Delegate to FastMCP's SSE handler
-    return await mcp.sse_app()(request.scope, request.receive, request.send)
+    async with _sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await mcp._mcp_server.run(
+            streams[0],
+            streams[1],
+            mcp._mcp_server.create_initialization_options(),
+        )
 
 
-@app.post("/messages")
-async def messages_endpoint(request: Request):
-    """SSE message posting endpoint — auth checked via session established at /sse."""
-    return await mcp.sse_app()(request.scope, request.receive, request.send)
+async def _messages_asgi(scope, receive, send):
+    """Thin ASGI shim around handle_post_message.
+
+    handle_post_message is an ASGI app that sends its own HTTP responses, so it
+    cannot be wrapped in a FastAPI route (would cause double-response errors).
+
+    BrokenResourceError means the SSE connection already closed while a valid
+    session exists — return 410 Gone rather than letting uvicorn log a 500.
+    """
+    try:
+        await _sse_transport.handle_post_message(scope, receive, send)
+    except anyio.BrokenResourceError:
+        await send({
+            "type": "http.response.start",
+            "status": 410,
+            "headers": [[b"content-type", b"text/plain"]],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b"SSE session closed",
+            "more_body": False,
+        })
+
+
+app.mount("/messages", _messages_asgi)
 
 
 # ── Entry points ──────────────────────────────────────────────────────────────
@@ -164,6 +213,7 @@ def run_stdio() -> None:
     async def _run():
         await postgis.init_pool()
         await redis_cache.init_redis()
+        await qdrant_mod.init_qdrant()   # needed for search_pois
         log.info("stdio_server_starting")
         async with stdio_server() as (read_stream, write_stream):
             await mcp._mcp_server.run(

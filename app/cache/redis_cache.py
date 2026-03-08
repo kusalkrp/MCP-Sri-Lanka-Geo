@@ -48,7 +48,10 @@ async def init_redis() -> aioredis.Redis:
         socket_connect_timeout=2,
         socket_timeout=2,
     )
-    log.info("redis_client_ready", url=settings.redis_url)
+    # Log host only — URL may contain password (redis://:pass@host:port)
+    from urllib.parse import urlparse
+    parsed = urlparse(settings.redis_url)
+    log.info("redis_client_ready", host=parsed.hostname, port=parsed.port)
     return _redis
 
 

@@ -8,6 +8,15 @@
 
 ---
 
+## Related Documentation
+
+- [DATA_PIPELINE_GUIDE.md](./DATA_PIPELINE_GUIDE.md) for the concrete commands and expected outputs used in the current repo
+- [SYSTEM_SPEC.md](./SYSTEM_SPEC.md) for the implemented runtime architecture and production assumptions
+- [MCP_SRILANKA_GEO.md](./MCP_SRILANKA_GEO.md) for the original requirements, milestone plan, and system design intent
+- [SECURITY.md](./SECURITY.md) for backup, credential, and deployment security considerations around pipeline execution
+
+---
+
 ## Table of Contents
 
 1. [Data Sources](#1-data-sources)

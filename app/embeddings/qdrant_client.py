@@ -17,10 +17,9 @@ Payload fields indexed: category, subcategory, district, province
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
-import logging
-import uuid
 from typing import Any
 
 import google.generativeai as genai
@@ -61,6 +60,10 @@ async def init_qdrant() -> AsyncQdrantClient:
         kwargs["api_key"] = settings.qdrant_api_key
 
     _qdrant = AsyncQdrantClient(**kwargs)
+
+    # Configure Gemini once at startup — not on every embed call
+    _configure_gemini()
+
     log.info("qdrant_client_ready", url=settings.qdrant_url, collection=COLLECTION_NAME)
     return _qdrant
 
@@ -151,6 +154,20 @@ def build_embed_text(poi: dict) -> str:
     return " | ".join(p for p in parts if p and str(p).strip())
 
 
+def _embed_sync(texts: list[str], task_type: str) -> list[list[float]]:
+    """Synchronous Gemini embed call — always run via run_in_executor."""
+    result = genai.embed_content(
+        model=EMBED_MODEL,
+        content=texts,
+        task_type=task_type,
+        output_dimensionality=EMBED_DIM,
+    )
+    embeddings = result["embedding"]
+    if isinstance(embeddings[0], float):
+        return [embeddings]
+    return embeddings
+
+
 async def embed_with_retry(
     texts: list[str],
     max_retries: int = 5,
@@ -158,25 +175,17 @@ async def embed_with_retry(
 ) -> list[list[float]]:
     """
     Embed a batch of texts using Gemini text-embedding-004.
+    Runs the synchronous Gemini SDK call in a thread pool executor so it never
+    blocks the asyncio event loop.
     Exponential backoff on 429 (rate limit) and transient errors.
     texts must be <= EMBED_BATCH (100) in length.
     """
-    _configure_gemini()
+    loop = asyncio.get_event_loop()
 
     for attempt in range(max_retries):
         try:
-            result = genai.embed_content(
-                model=EMBED_MODEL,
-                content=texts,
-                task_type=task_type,
-                output_dimensionality=EMBED_DIM,
-            )
-            # result["embedding"] is list[float] for single; list[list[float]] for batch
-            embeddings = result["embedding"]
-            if isinstance(embeddings[0], float):
-                # Single text — wrap for consistent return type
-                return [embeddings]
-            return embeddings
+            fn = functools.partial(_embed_sync, texts, task_type)
+            return await loop.run_in_executor(None, fn)
 
         except Exception as exc:
             err_str = str(exc).lower()
@@ -193,6 +202,8 @@ async def embed_with_retry(
                 log.error("embed_failed_after_retries", attempts=max_retries, error=repr(exc))
                 raise
 
+    raise RuntimeError("embed_with_retry called with max_retries <= 0")
+
 
 async def embed_query_cached(query: str) -> list[float]:
     """
@@ -200,7 +211,7 @@ async def embed_query_cached(query: str) -> list[float]:
     Identical queries (hospital, bank, restaurant) hit cache.
     Falls back to direct embed on Redis miss/failure.
     """
-    from app.cache.redis_cache import get_redis, TTL_SEMANTIC
+    from app.cache.redis_cache import get_redis
 
     key = f"embed:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
     r = get_redis()

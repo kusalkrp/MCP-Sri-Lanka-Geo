@@ -1,0 +1,18 @@
+# Development, testing, and ingestion script dependencies
+# Install with: pip install -r requirements-dev.txt
+# NOT installed in the production Docker image
+-r requirements.txt
+
+# OSM ingestion (requires C++ osmium libs — see scripts/README or DATA_PIPELINE.md)
+osmium==3.7.0
+
+# Enrichment scripts
+rapidfuzz==3.11.0
+
+# Script utilities
+python-dotenv==1.0.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2
+httpx==0.28.1

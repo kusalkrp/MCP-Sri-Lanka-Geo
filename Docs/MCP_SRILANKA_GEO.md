@@ -8,6 +8,16 @@
 
 ---
 
+## Related Documentation
+
+- [SYSTEM_SPEC.md](./SYSTEM_SPEC.md) for the current implementation-oriented system specification
+- [API_REFERENCE.md](./API_REFERENCE.md) for tool-level contract details and endpoint behavior
+- [DATA_PIPELINE.md](./DATA_PIPELINE.md) for source selection, preprocessing, and update strategy
+- [DATA_PIPELINE_GUIDE.md](./DATA_PIPELINE_GUIDE.md) for the operational execution order used by the live pipeline
+- [SECURITY.md](./SECURITY.md) for the security model applied to transports, secrets, and deployment
+
+---
+
 ## Table of Contents
 
 1. [Executive Summary](#1-executive-summary)

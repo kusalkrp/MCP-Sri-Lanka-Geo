@@ -2,21 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps for osmium (pyosmium C++ bindings)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libosmium-dev \
-    libprotozero-dev \
-    libboost-program-options-dev \
-    libexpat1-dev \
-    zlib1g-dev \
-    libbz2-dev \
-    libprotobuf-dev \
-    protobuf-compiler \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
-
 # Install Python dependencies before copying app code
 # (layer cached unless requirements.txt changes)
+# requirements.txt is production-only — no osmium, no pytest, no ingestion deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

@@ -397,6 +397,17 @@ async def get_route_data(origin_id: str, dest_id: str) -> dict | None:
     return _row_to_dict(row)
 
 
+async def check_pois_exist(*poi_ids: str) -> set[str]:
+    """Return the subset of poi_ids that exist and are not soft-deleted."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id FROM pois WHERE id = ANY($1) AND deleted_at IS NULL",
+            list(poi_ids),
+        )
+    return {r["id"] for r in rows}
+
+
 async def get_spatial_candidates(
     lat: float,
     lng: float,

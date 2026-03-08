@@ -545,12 +545,11 @@ def _register_week4_tools(mcp: FastMCP) -> None:
             data = await postgis.get_route_data(origin_poi_id, dest_poi_id)
 
             if data is None:
-                # Determine which POI is missing
-                o = await postgis.get_poi_by_id(origin_poi_id)
-                d = await postgis.get_poi_by_id(dest_poi_id)
-                if not o:
+                # Single query to identify which POI(s) are missing
+                existing = await postgis.check_pois_exist(origin_poi_id, dest_poi_id)
+                if origin_poi_id not in existing:
                     return {"error": f"POI not found or deleted: {origin_poi_id}"}
-                if not d:
+                if dest_poi_id not in existing:
                     return {"error": f"POI not found or deleted: {dest_poi_id}"}
                 return {"error": "Could not compute route data"}
 

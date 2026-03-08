@@ -118,7 +118,7 @@ async def process(dry_run: bool = False, limit: int | None = None) -> None:
         # Assign UUIDs (or reuse existing qdrant_id)
         points = []
         for poi, vector in zip(pois_valid, vectors):
-            qid = poi.get("qdrant_id") or str(uuid.uuid4())
+            qid = str(poi.get("qdrant_id") or uuid.uuid4())
             poi["qdrant_id"] = qid
             points.append(make_point(poi["id"], qid, vector, poi))
 
