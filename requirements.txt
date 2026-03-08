@@ -1,0 +1,40 @@
+# MCP & Web Framework
+# IMPORTANT: pin mcp version — protocol has breaking changes between minor versions
+mcp==1.3.0
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sse-starlette==2.2.1
+python-multipart==0.0.20
+
+# Database (async)
+asyncpg==0.30.0
+
+# Vector DB
+qdrant-client==1.13.2
+
+# Cache
+redis==5.2.1
+
+# Settings & Validation
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# Embeddings
+google-generativeai==0.8.3
+
+# OSM parsing (pyosmium — requires C++ osmium libs, see Dockerfile)
+osmium==3.7.0
+
+# Enrichment matching
+rapidfuzz==3.11.0
+httpx==0.28.1
+
+# Logging
+structlog==25.1.0
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2
+
+# Utilities
+python-dotenv==1.0.1
