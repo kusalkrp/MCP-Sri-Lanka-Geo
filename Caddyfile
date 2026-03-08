@@ -1,0 +1,49 @@
+# Caddyfile — mcp-srilanka-geo reverse proxy
+#
+# Set DOMAIN environment variable before running:
+#   export DOMAIN=geo.yourdomain.com
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Caddy auto-provisions a Let's Encrypt TLS certificate.
+# HTTP → HTTPS redirect is automatic.
+
+{$DOMAIN} {
+    # Reverse proxy to the MCP server
+    reverse_proxy app:8080 {
+        # Health check for Caddy's upstream
+        health_uri    /health
+        health_interval 30s
+        health_timeout  10s
+
+        # Preserve real client IP
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # SSE connections — disable buffering for real-time streaming
+    @sse path /sse
+    handle @sse {
+        reverse_proxy app:8080 {
+            flush_interval -1    # disable response buffering for SSE
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options    "nosniff"
+        X-Frame-Options           "DENY"
+        -Server                   # remove Server header
+    }
+
+    # Access log
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10MB
+            roll_keep 5
+        }
+        format json
+    }
+}

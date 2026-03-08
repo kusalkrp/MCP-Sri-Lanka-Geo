@@ -84,7 +84,9 @@ def poi_detail_key(poi_id: str) -> str:
 
 def semantic_key(query: str, lat: float | None, lng: float | None,
                  radius_km: float, category: str | None) -> str:
-    raw = f"{query}|{lat:.4f if lat else 'x'}|{lng:.4f if lng else 'x'}|{radius_km}|{category or 'all'}"
+    lat_part = f"{lat:.4f}" if lat is not None else "x"
+    lng_part = f"{lng:.4f}" if lng is not None else "x"
+    raw = f"{query}|{lat_part}|{lng_part}|{radius_km}|{category or 'all'}"
     digest = hashlib.sha256(raw.encode()).hexdigest()[:16]
     return f"semantic:{digest}"
 

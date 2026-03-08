@@ -1,7 +1,6 @@
 """
 test_tools.py
-Tests for Week 2 MCP tools: find_nearby, get_poi_details, get_administrative_area,
-validate_coordinates, get_coverage_stats.
+Tests for all 12 MCP tools (Week 2 + Week 4).
 
 Requires: running PostGIS + Redis (Week 1 data must be loaded).
 """
@@ -252,3 +251,198 @@ async def test_coverage_stats_unknown_district_returns_empty():
     result = await call("get_coverage_stats", {"district": "NonExistent District"})
     assert "error" not in result
     assert result["total_pois"] == 0
+
+
+# ── list_categories ───────────────────────────────────────────────────────────
+
+async def test_list_categories_national():
+    result = await call("list_categories", {})
+    assert "error" not in result
+    assert result["total_categories"] > 0
+    assert result["district_filter"] is None
+    assert len(result["categories"]) > 0
+    # Each entry must have the required fields
+    cat = result["categories"][0]
+    assert "category" in cat
+    assert "subcategory" in cat
+    assert "poi_count" in cat
+
+
+async def test_list_categories_by_district():
+    result = await call("list_categories", {"district": "Colombo"})
+    assert "error" not in result
+    assert result["district_filter"] == "Colombo"
+    assert result["total_categories"] > 0
+
+
+async def test_list_categories_unknown_district():
+    result = await call("list_categories", {"district": "NonExistentDistrict"})
+    assert "error" not in result
+    assert result["total_categories"] == 0
+
+
+# ── get_business_density ──────────────────────────────────────────────────────
+
+async def test_get_business_density_colombo():
+    result = await call("get_business_density", {
+        "lat": COLOMBO["lat"], "lng": COLOMBO["lng"], "radius_km": 2.0
+    })
+    assert "error" not in result
+    assert result["total_pois"] > 0
+    assert len(result["breakdown"]) > 0
+    row = result["breakdown"][0]
+    assert "category" in row and "subcategory" in row and "poi_count" in row
+
+
+async def test_get_business_density_outside_sl_rejected():
+    result = await call("get_business_density", {
+        "lat": OUTSIDE_SL["lat"], "lng": OUTSIDE_SL["lng"]
+    })
+    assert "error" in result
+    assert result.get("valid") is False
+
+
+async def test_get_business_density_ocean_returns_low():
+    """Ocean point may have zero or few POIs — must not crash."""
+    result = await call("get_business_density", {
+        "lat": OCEAN_PT["lat"], "lng": OCEAN_PT["lng"], "radius_km": 0.5
+    })
+    assert "error" not in result
+    assert "total_pois" in result
+
+
+# ── route_between ─────────────────────────────────────────────────────────────
+
+# Real POI IDs from the loaded dataset (near Colombo)
+_ROUTE_ORIGIN = "n3780542013"   # Law College
+_ROUTE_DEST   = "n8513505368"   # Crown (Bedsheets and Towels)
+
+
+async def test_route_between_valid_pois():
+    result = await call("route_between", {
+        "origin_poi_id": _ROUTE_ORIGIN,
+        "dest_poi_id":   _ROUTE_DEST,
+    })
+    assert "error" not in result
+    assert result["distance_m"] > 0
+    assert result["distance_km"] > 0
+    assert 0 <= result["bearing_deg"] < 360
+    assert "origin" in result and "destination" in result
+    assert result["origin"]["poi_id"] == _ROUTE_ORIGIN
+    assert result["destination"]["poi_id"] == _ROUTE_DEST
+
+
+async def test_route_between_same_poi_rejected():
+    result = await call("route_between", {
+        "origin_poi_id": _ROUTE_ORIGIN,
+        "dest_poi_id":   _ROUTE_ORIGIN,
+    })
+    assert "error" in result
+
+
+async def test_route_between_missing_poi():
+    result = await call("route_between", {
+        "origin_poi_id": "n0000000000",  # non-existent
+        "dest_poi_id":   _ROUTE_DEST,
+    })
+    assert "error" in result
+
+
+async def test_route_between_empty_id():
+    result = await call("route_between", {
+        "origin_poi_id": "",
+        "dest_poi_id":   _ROUTE_DEST,
+    })
+    assert "error" in result
+
+
+# ── find_universities ─────────────────────────────────────────────────────────
+
+async def test_find_universities_colombo():
+    result = await call("find_universities", {
+        "lat": COLOMBO["lat"], "lng": COLOMBO["lng"], "radius_km": 20.0
+    })
+    assert "error" not in result
+    assert result["total"] > 0
+    for r in result["results"]:
+        assert r["subcategory"] in ("university", "college", "educational_institution")
+
+
+async def test_find_universities_outside_sl_rejected():
+    result = await call("find_universities", {
+        "lat": OUTSIDE_SL["lat"], "lng": OUTSIDE_SL["lng"]
+    })
+    assert "error" in result
+    assert result.get("valid") is False
+
+
+async def test_find_universities_limit_respected():
+    result = await call("find_universities", {
+        "lat": COLOMBO["lat"], "lng": COLOMBO["lng"],
+        "radius_km": 50.0, "limit": 3
+    })
+    assert "error" not in result
+    assert len(result["results"]) <= 3
+
+
+# ── find_agricultural_zones ───────────────────────────────────────────────────
+
+async def test_find_agricultural_zones_returns_results():
+    """Kandy / Central Province has rice paddies and farmland."""
+    result = await call("find_agricultural_zones", {
+        "lat": KANDY["lat"], "lng": KANDY["lng"], "radius_km": 20.0
+    })
+    assert "error" not in result
+    assert "results" in result
+    for r in result["results"]:
+        assert r["subcategory"] in (
+            "farmland", "orchard", "greenhouse",
+            "aquaculture", "vineyard", "reservoir"
+        )
+
+
+async def test_find_agricultural_zones_outside_sl_rejected():
+    result = await call("find_agricultural_zones", {
+        "lat": OUTSIDE_SL["lat"], "lng": OUTSIDE_SL["lng"]
+    })
+    assert "error" in result
+    assert result.get("valid") is False
+
+
+# ── find_businesses_near ──────────────────────────────────────────────────────
+
+async def test_find_businesses_near_colombo():
+    result = await call("find_businesses_near", {
+        "lat": COLOMBO["lat"], "lng": COLOMBO["lng"], "radius_km": 2.0
+    })
+    assert "error" not in result
+    assert result["total"] > 0
+    assert result["business_type_filter"] is None
+
+
+async def test_find_businesses_near_with_type():
+    result = await call("find_businesses_near", {
+        "lat": COLOMBO["lat"], "lng": COLOMBO["lng"],
+        "radius_km": 5.0, "business_type": "restaurant"
+    })
+    assert "error" not in result
+    assert result["business_type_filter"] == "restaurant"
+    for r in result["results"]:
+        assert r["subcategory"] == "restaurant"
+
+
+async def test_find_businesses_near_outside_sl_rejected():
+    result = await call("find_businesses_near", {
+        "lat": OUTSIDE_SL["lat"], "lng": OUTSIDE_SL["lng"]
+    })
+    assert "error" in result
+    assert result.get("valid") is False
+
+
+async def test_find_businesses_near_limit():
+    result = await call("find_businesses_near", {
+        "lat": COLOMBO["lat"], "lng": COLOMBO["lng"],
+        "radius_km": 5.0, "limit": 3
+    })
+    assert "error" not in result
+    assert len(result["results"]) <= 3

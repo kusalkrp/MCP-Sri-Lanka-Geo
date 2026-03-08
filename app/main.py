@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP
 from app.cache import redis_cache
 from app.config import settings
 from app.db import postgis
+from app.embeddings import qdrant_client as qdrant_mod
 from app.tools import register_tools
 
 log = structlog.get_logger()
@@ -57,6 +58,7 @@ app = FastAPI(
 async def startup() -> None:
     await postgis.init_pool()
     await redis_cache.init_redis()
+    await qdrant_mod.init_qdrant()
     log.info("app_startup_complete", version=settings.app_version)
 
 
@@ -64,6 +66,7 @@ async def startup() -> None:
 async def shutdown() -> None:
     await postgis.close_pool()
     await redis_cache.close_redis()
+    await qdrant_mod.close_qdrant()
     log.info("app_shutdown_complete")
 
 
@@ -71,8 +74,47 @@ async def shutdown() -> None:
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    """Shallow health check — returns 200 if app is running."""
-    return JSONResponse({"status": "ok", "version": settings.app_version})
+    """
+    Detailed dependency health check.
+    Returns 200 if all required dependencies are ok (or degraded for Redis).
+    Returns 503 if PostGIS or Qdrant are unreachable.
+
+    Redis is "degraded" when down — cache is optional, tools still function.
+    PostGIS and Qdrant are "error" when down — tools cannot function.
+    """
+    deps: dict[str, str] = {}
+
+    # PostGIS — required
+    try:
+        pool = postgis.get_pool()
+        await pool.fetchval("SELECT 1")
+        deps["postgis"] = "ok"
+    except Exception:
+        deps["postgis"] = "error"
+
+    # Qdrant — required for search_pois
+    try:
+        client = qdrant_mod.get_qdrant()
+        await client.get_collections()
+        deps["qdrant"] = "ok"
+    except Exception:
+        deps["qdrant"] = "error"
+
+    # Redis — optional (cache degrades gracefully)
+    try:
+        r = redis_cache.get_redis()
+        await r.ping()
+        deps["redis"] = "ok"
+    except Exception:
+        deps["redis"] = "degraded"  # degraded, not error — cache is optional
+
+    all_ok = all(v in ("ok", "degraded") for v in deps.values())
+    status_code = 200 if all_ok else 503
+
+    return JSONResponse(
+        {"version": settings.app_version, "dependencies": deps},
+        status_code=status_code,
+    )
 
 
 # ── SSE transport — ALWAYS requires auth ─────────────────────────────────────

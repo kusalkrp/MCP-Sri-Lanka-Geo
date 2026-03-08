@@ -1,0 +1,59 @@
+# docker-compose.prod.yml — production overrides
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Differences from dev:
+#   - No direct port exposure for postgres/qdrant/redis (internal only)
+#   - App port 8080 bound only to localhost (Caddy proxies externally)
+#   - Caddy service added (HTTPS + reverse proxy)
+#   - All services set to restart: always
+#   - Qdrant gRPC port (6334) not exposed
+#   - App uses production uvicorn settings (workers, access log off)
+
+services:
+  app:
+    ports:
+      - "127.0.0.1:8080:8080"   # Caddy proxies; not publicly exposed
+    restart: always
+    environment:
+      - REQUIRE_AUTH=true
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  postgres:
+    ports: []          # not exposed — Caddy/app connect via Docker network
+    restart: always
+
+  qdrant:
+    ports: []          # not exposed externally
+    restart: always
+
+  redis:
+    ports: []          # not exposed externally
+    restart: always
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: srilanka-geo-caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

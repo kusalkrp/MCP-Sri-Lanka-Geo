@@ -211,6 +211,192 @@ async def get_coverage_stats(district: str | None = None) -> list[dict]:
     return _rows_to_list(rows)
 
 
+async def find_universities_nearby(
+    lat: float,
+    lng: float,
+    radius_m: float,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Find universities and colleges near a point.
+    Tag discovery (2026-03-09): amenity=university/college and office=educational_institution
+    are the authoritative tags for higher education in the SL dataset.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+                id, name, name_si, name_ta, category, subcategory,
+                ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                address, tags, wikidata_id, quality_score,
+                ST_Distance(geom::geography,
+                            ST_MakePoint($2, $1)::geography) AS distance_m
+            FROM pois
+            WHERE deleted_at IS NULL
+              AND (
+                (category = 'amenity' AND subcategory IN ('university', 'college'))
+                OR (category = 'office' AND subcategory = 'educational_institution')
+              )
+              AND ST_DWithin(geom::geography,
+                             ST_MakePoint($2, $1)::geography,
+                             $3)
+            ORDER BY distance_m
+            LIMIT $4
+        """, lat, lng, radius_m, limit)
+    return _rows_to_list(rows)
+
+
+async def find_agricultural_zones_nearby(
+    lat: float,
+    lng: float,
+    radius_m: float,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Find agricultural landuse zones near a point.
+    Tag discovery (2026-03-09): landuse=farmland (1927+1483), orchard (159),
+    reservoir (543) are the dominant agricultural tags in the SL dataset.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+                id, name, name_si, category, subcategory,
+                ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                address, tags, quality_score,
+                ST_Distance(geom::geography,
+                            ST_MakePoint($2, $1)::geography) AS distance_m
+            FROM pois
+            WHERE deleted_at IS NULL
+              AND category = 'landuse'
+              AND subcategory IN (
+                  'farmland', 'orchard', 'greenhouse',
+                  'aquaculture', 'vineyard', 'reservoir'
+              )
+              AND ST_DWithin(geom::geography,
+                             ST_MakePoint($2, $1)::geography,
+                             $3)
+            ORDER BY distance_m
+            LIMIT $4
+        """, lat, lng, radius_m, limit)
+    return _rows_to_list(rows)
+
+
+async def find_businesses_nearby(
+    lat: float,
+    lng: float,
+    radius_m: float,
+    business_type: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Find commercial businesses near a point.
+    Covers shop, office categories and commercial amenity subcategories.
+    Optional business_type filters by subcategory (e.g. 'restaurant', 'bank').
+    """
+    COMMERCIAL_AMENITY = (
+        'restaurant', 'cafe', 'bank', 'fuel', 'pharmacy', 'fast_food',
+        'bar', 'marketplace', 'atm', 'supermarket', 'post_office',
+        'money_transfer', 'bureau_de_change',
+    )
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        if business_type:
+            rows = await conn.fetch("""
+                SELECT
+                    id, name, name_si, category, subcategory,
+                    ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                    address, tags, quality_score,
+                    ST_Distance(geom::geography,
+                                ST_MakePoint($2, $1)::geography) AS distance_m
+                FROM pois
+                WHERE deleted_at IS NULL
+                  AND subcategory = $5
+                  AND ST_DWithin(geom::geography,
+                                 ST_MakePoint($2, $1)::geography,
+                                 $3)
+                ORDER BY distance_m
+                LIMIT $4
+            """, lat, lng, radius_m, limit, business_type)
+        else:
+            rows = await conn.fetch("""
+                SELECT
+                    id, name, name_si, category, subcategory,
+                    ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                    address, tags, quality_score,
+                    ST_Distance(geom::geography,
+                                ST_MakePoint($2, $1)::geography) AS distance_m
+                FROM pois
+                WHERE deleted_at IS NULL
+                  AND (
+                    category IN ('shop', 'office')
+                    OR (category = 'amenity'
+                        AND subcategory = ANY($5::text[]))
+                  )
+                  AND ST_DWithin(geom::geography,
+                                 ST_MakePoint($2, $1)::geography,
+                                 $3)
+                ORDER BY distance_m
+                LIMIT $4
+            """, lat, lng, radius_m, limit, list(COMMERCIAL_AMENITY))
+    return _rows_to_list(rows)
+
+
+async def get_density_breakdown(
+    lat: float,
+    lng: float,
+    radius_m: float,
+) -> list[dict]:
+    """
+    Aggregate POIs in radius by category/subcategory.
+    Spatial index pre-filters to the radius first — safe for runtime aggregation
+    on a small result set (typically <1000 POIs in a 2km city radius).
+    Never runs GROUP BY on the full pois table.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT category, subcategory, COUNT(*) AS poi_count
+            FROM pois
+            WHERE deleted_at IS NULL
+              AND ST_DWithin(geom::geography,
+                             ST_MakePoint($2, $1)::geography,
+                             $3)
+            GROUP BY category, subcategory
+            ORDER BY poi_count DESC
+        """, lat, lng, radius_m)
+    return _rows_to_list(rows)
+
+
+async def get_route_data(origin_id: str, dest_id: str) -> dict | None:
+    """
+    Compute straight-line distance and bearing between two POIs.
+    Returns None if either POI is missing or deleted.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT
+                a.id AS origin_id,
+                a.name AS origin_name,
+                ST_Y(a.geom) AS origin_lat,
+                ST_X(a.geom) AS origin_lng,
+                b.id AS dest_id,
+                b.name AS dest_name,
+                ST_Y(b.geom) AS dest_lat,
+                ST_X(b.geom) AS dest_lng,
+                ROUND(ST_Distance(a.geom::geography,
+                                  b.geom::geography)::numeric, 1) AS distance_m,
+                ROUND(degrees(ST_Azimuth(a.geom, b.geom))::numeric, 1) AS bearing_deg
+            FROM pois a, pois b
+            WHERE a.id = $1
+              AND b.id = $2
+              AND a.deleted_at IS NULL
+              AND b.deleted_at IS NULL
+        """, origin_id, dest_id)
+    return _row_to_dict(row)
+
+
 async def get_spatial_candidates(
     lat: float,
     lng: float,
