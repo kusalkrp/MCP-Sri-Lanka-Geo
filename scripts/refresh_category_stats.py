@@ -37,14 +37,14 @@ async def main() -> None:
             inserted = await conn.execute("""
                 INSERT INTO category_stats (district, province, category, subcategory, poi_count)
                 SELECT
-                    COALESCE(address->>'district', 'Unknown')   AS district,
-                    COALESCE(address->>'province', 'Unknown')   AS province,
-                    COALESCE(category,   'unknown')             AS category,
-                    COALESCE(subcategory, '')                   AS subcategory,
-                    COUNT(*)                                    AS poi_count
+                    COALESCE(address->>'district', 'Unknown')          AS district,
+                    COALESCE(MAX(address->>'province'), 'Unknown')     AS province,
+                    COALESCE(category,   'unknown')                    AS category,
+                    COALESCE(subcategory, '')                          AS subcategory,
+                    COUNT(*)                                           AS poi_count
                 FROM pois
                 WHERE deleted_at IS NULL
-                GROUP BY 1, 2, 3, 4
+                GROUP BY 1, 3, 4
             """)
 
             count = await conn.fetchval("SELECT COUNT(*) FROM category_stats")

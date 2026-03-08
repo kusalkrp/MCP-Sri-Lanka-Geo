@@ -52,7 +52,6 @@ async def backfill_via_contains(conn: asyncpg.Connection) -> int:
         WHERE d.level = 6
           AND ST_Contains(d.geom, p.geom)
           AND p.deleted_at IS NULL
-          AND (p.address->>'district' IS NULL OR p.address->>'district' = '')
     """)
     # asyncpg returns "UPDATE N" string
     updated = int(result.split()[-1])
@@ -92,6 +91,7 @@ async def backfill_coastal_fallback(conn: asyncpg.Connection) -> int:
                 ON pr.id = d.parent_id AND pr.level = 4
             WHERE poi.deleted_at IS NULL
               AND (poi.address->>'district' IS NULL OR poi.address->>'district' = '')
+              -- Coastal fallback only for POIs not matched by ST_Contains
         ) nearest
         WHERE p.id = nearest.poi_id
     """)
@@ -183,8 +183,14 @@ async def main() -> None:
                  district_coverage_pct=stats["district_coverage_pct"])
 
         if stats["sparse_districts"]:
+            # Encode district names ASCII-safe for Windows console compatibility
+            safe_districts = [
+                {k: v.encode("ascii", "replace").decode() if isinstance(v, str) else v
+                 for k, v in d.items()}
+                for d in stats["sparse_districts"]
+            ]
             log.warning("sparse_districts_found",
-                        districts=stats["sparse_districts"],
+                        districts=safe_districts,
                         msg="Consider lowering quality threshold for these districts")
 
         if stats["missing_district"] > 0:

@@ -1,16 +1,22 @@
 """
 load_admin_boundaries.py
-Load GADM GeoJSON administrative boundaries into PostGIS.
+Load Sri Lanka administrative boundaries into PostGIS.
 
-Must run BEFORE ingest_osm.py (spatial backfill depends on admin_boundaries).
+GADM v4.1 structure for Sri Lanka (LKA):
+  gadm41_LKA_1.json  →  25 Districts   (GADM Level 1)
+  gadm41_LKA_2.json  →  323 DS Divisions (GADM Level 2, optional)
+
+Provinces are NOT in GADM for Sri Lanka. They are created here by dissolving
+(ST_Union) the district polygons grouped by a hardcoded district→province mapping.
 
 Usage:
     python scripts/load_admin_boundaries.py \\
         --level1 data/gadm41_LKA_1.json \\
-        --level2 data/gadm41_LKA_2.json
+        [--level2 data/gadm41_LKA_2.json]
 
-Download GADM files:
-    https://gadm.org/download_country.html → Sri Lanka → GeoJSON → Level 1 and Level 2
+Download:
+    https://geodata.ucdavis.edu/gadm/gadm4.1/json/gadm41_LKA_1.json
+    https://geodata.ucdavis.edu/gadm/gadm4.1/json/gadm41_LKA_2.json
 """
 
 from __future__ import annotations
@@ -24,137 +30,231 @@ from pathlib import Path
 import asyncpg
 import structlog
 
-# Allow importing app modules from project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.config import settings
 
 log = structlog.get_logger()
 
-
-# GADM level 1 → our admin level 4 (Province)
-# GADM level 2 → our admin level 6 (District)
-GADM_TO_ADMIN_LEVEL = {1: 4, 2: 6}
-
-# Sinhala names for Sri Lanka's 9 provinces (manual mapping — GADM has no Sinhala)
-PROVINCE_SINHALA = {
-    "Western Province":        "බස්නාහිර පළාත",
-    "Central Province":        "මධ්‍යම පළාත",
-    "Southern Province":       "දකුණු පළාත",
-    "Northern Province":       "උතුරු පළාත",
-    "Eastern Province":        "නැගෙනහිර පළාත",
-    "North Western Province":  "වයඹ පළාත",
-    "North Central Province":  "උතුරු මැද පළාත",
-    "Uva Province":            "ඌව පළාත",
-    "Sabaragamuwa Province":   "සබරගමුව පළාත",
+# ---- District → Province mapping (all 25 districts) ----
+DISTRICT_TO_PROVINCE: dict[str, str] = {
+    "Colombo":       "Western Province",
+    "Gampaha":       "Western Province",
+    "Kalutara":      "Western Province",
+    "Kandy":         "Central Province",
+    "Matale":        "Central Province",
+    "Nuwara Eliya":  "Central Province",
+    "NuwaraEliya":   "Central Province",  # GADM spelling variant
+    "Galle":         "Southern Province",
+    "Matara":        "Southern Province",
+    "Hambantota":    "Southern Province",
+    "Jaffna":        "Northern Province",
+    "Kilinochchi":   "Northern Province",
+    "Mannar":        "Northern Province",
+    "Vavuniya":      "Northern Province",
+    "Mullaitivu":    "Northern Province",
+    "Batticaloa":    "Eastern Province",
+    "Ampara":        "Eastern Province",
+    "Trincomalee":   "Eastern Province",
+    "Kurunegala":    "North Western Province",
+    "Puttalam":      "North Western Province",
+    "Anuradhapura":  "North Central Province",
+    "Polonnaruwa":   "North Central Province",
+    "Badulla":       "Uva Province",
+    "Monaragala":    "Uva Province",
+    "Moneragala":    "Uva Province",      # GADM spelling variant
+    "Ratnapura":     "Sabaragamuwa Province",
+    "Kegalle":       "Sabaragamuwa Province",
 }
 
-# Sinhala names for Sri Lanka's 25 districts
-DISTRICT_SINHALA = {
-    "Colombo":      "කොළඹ",      "Gampaha":     "ගම්පහ",
-    "Kalutara":     "කළුතර",     "Kandy":       "මහනුවර",
-    "Matale":       "මාතලේ",     "Nuwara Eliya": "නුවරඑළිය",
-    "Galle":        "ගාල්ල",     "Matara":      "මාතර",
-    "Hambantota":   "හම්බන්තොට", "Jaffna":      "යාපනය",
-    "Kilinochchi":  "කිළිනොච්චි","Mannar":      "මන්නාරම",
-    "Vavuniya":     "වවුනියාව",  "Mullaitivu":  "මුලතිව්",
-    "Batticaloa":   "මඩකලපුව",   "Ampara":      "අම්පාර",
-    "Trincomalee":  "තිරිකුණාමළය","Kurunegala":  "කුරුණෑගල",
-    "Puttalam":     "පුත්තලම",   "Anuradhapura":"අනුරාධපුරය",
-    "Polonnaruwa":  "පොළොන්නරුව","Badulla":     "බදුල්ල",
-    "Monaragala":   "මොණරාගල",   "Ratnapura":   "රත්නපුර",
+PROVINCE_SINHALA: dict[str, str] = {
+    "Western Province":       "බස්නාහිර පළාත",
+    "Central Province":       "මධ්‍යම පළාත",
+    "Southern Province":      "දකුණු පළාත",
+    "Northern Province":      "උතුරු පළාත",
+    "Eastern Province":       "නැගෙනහිර පළාත",
+    "North Western Province": "වයඹ පළාත",
+    "North Central Province": "උතුරු මැද පළාත",
+    "Uva Province":           "ඌව පළාත",
+    "Sabaragamuwa Province":  "සබරගමුව පළාත",
+}
+
+DISTRICT_SINHALA: dict[str, str] = {
+    "Colombo":      "කොළඹ",        "Gampaha":       "ගම්පහ",
+    "Kalutara":     "කළුතර",       "Kandy":         "මහනුවර",
+    "Matale":       "මාතලේ",       "Nuwara Eliya":  "නුවරඑළිය",
+    "Galle":        "ගාල්ල",       "Matara":        "මාතර",
+    "Hambantota":   "හම්බන්තොට",   "Jaffna":        "යාපනය",
+    "Kilinochchi":  "කිළිනොච්චි",  "Mannar":        "මන්නාරම",
+    "Vavuniya":     "වවුනියාව",    "Mullaitivu":    "මුලතිව්",
+    "Batticaloa":   "මඩකලපුව",     "Ampara":        "අම්පාර",
+    "Trincomalee":  "තිරිකුණාමළය", "Kurunegala":   "කුරුණෑගල",
+    "Puttalam":     "පුත්තලම",     "Anuradhapura":  "අනුරාධපුරය",
+    "Polonnaruwa":  "පොළොන්නරුව",  "Badulla":       "බදුල්ල",
+    "Monaragala":   "මොණරාගල",     "Ratnapura":     "රත්නපුර",
+    "Moneragala":   "මොණරාගල",     # GADM spelling variant
     "Kegalle":      "කෑගල්ල",
+    "NuwaraEliya":  "නුවරඑළිය",    # GADM spelling variant (no space)
 }
 
 
 def ensure_multipolygon(geometry: dict) -> dict:
-    """Wrap a Polygon geometry in MultiPolygon if needed."""
     if geometry["type"] == "Polygon":
         return {"type": "MultiPolygon", "coordinates": [geometry["coordinates"]]}
     return geometry
 
 
-async def load_level(
-    conn: asyncpg.Connection,
-    geojson_path: Path,
-    gadm_level: int,
-    province_name_to_id: dict[str, int],
-) -> int:
-    """Load one GADM level. Returns number of records inserted."""
-    admin_level = GADM_TO_ADMIN_LEVEL[gadm_level]
-    log.info("loading_admin_level", gadm_level=gadm_level, admin_level=admin_level,
-             file=geojson_path.name)
+async def load_districts(conn: asyncpg.Connection, geojson_path: Path) -> int:
+    """Load GADM Level 1 (Districts) as admin level 6. Returns count inserted."""
+    log.info("loading_districts", file=geojson_path.name)
 
     with open(geojson_path, encoding="utf-8") as f:
         data = json.load(f)
 
     features = data.get("features", [])
-    log.info("features_found", count=len(features))
-
     inserted = 0
-    for feature in features:
-        props = feature.get("properties", {})
-        geometry = feature.get("geometry")
 
-        if not geometry:
-            log.warning("skipping_feature_no_geometry", props=props)
+    for feature in features:
+        props  = feature.get("properties", {})
+        geom   = feature.get("geometry")
+        if not geom:
             continue
 
-        geom = ensure_multipolygon(geometry)
-        geom_json = json.dumps(geom)
+        name    = props.get("NAME_1", "").strip()
+        gid     = props.get("GID_1", "")
+        province_name = DISTRICT_TO_PROVINCE.get(name)
 
-        if gadm_level == 1:
-            name = props.get("NAME_1", "").strip()
-            # GADM appends " Province" to some names — normalise
-            if not name.endswith("Province"):
-                name = f"{name} Province"
-            name_si = PROVINCE_SINHALA.get(name)
-            parent_id = None
+        if not province_name:
+            log.warning("unknown_district_no_province_mapping", district=name)
+            province_name = "Unknown"
 
-        elif gadm_level == 2:
-            name = props.get("NAME_2", "").strip()
-            name_si = DISTRICT_SINHALA.get(name)
-            # Link to parent province via GID_1
-            gid_1 = props.get("GID_1", "")
-            # GID_1 looks like "LKA.1_1" — find province by matching GID
-            parent_id = await conn.fetchval(
-                "SELECT id FROM admin_boundaries WHERE meta->>'gid' = $1 AND level = 4",
-                gid_1,
-            )
-            if parent_id is None:
-                log.warning("parent_province_not_found", gid_1=gid_1, district=name)
-
-        else:
-            raise ValueError(f"Unsupported GADM level: {gadm_level}")
+        mp_geom = ensure_multipolygon(geom)
 
         await conn.execute("""
-            INSERT INTO admin_boundaries (name, name_si, level, geom, parent_id, meta)
-            VALUES ($1, $2, $3, ST_SetSRID(ST_GeomFromGeoJSON($4), 4326), $5, $6)
+            INSERT INTO admin_boundaries (name, name_si, level, geom, meta)
+            VALUES ($1, $2, 6,
+                    ST_SetSRID(ST_GeomFromGeoJSON($3), 4326),
+                    $4::jsonb)
             ON CONFLICT DO NOTHING
         """,
             name,
-            name_si,
-            admin_level,
-            geom_json,
-            parent_id,
-            json.dumps({
-                "gid": props.get(f"GID_{gadm_level}", ""),
-                "gadm_level": gadm_level,
-            }),
+            DISTRICT_SINHALA.get(name),
+            json.dumps(mp_geom),
+            json.dumps({"gid": gid, "province": province_name}),
         )
         inserted += 1
 
-        if gadm_level == 1:
-            # Store province name → DB id for district parent linking
-            row_id = await conn.fetchval(
-                "SELECT id FROM admin_boundaries WHERE name = $1 AND level = 4", name
-            )
-            province_name_to_id[props.get(f"GID_{gadm_level}", "")] = row_id
+    log.info("districts_loaded", count=inserted)
+    return inserted
 
+
+async def create_provinces_from_districts(conn: asyncpg.Connection) -> int:
+    """
+    Create 9 province records by dissolving (ST_Union) district geometries.
+    Province geometry = union of all its district polygons.
+    """
+    log.info("creating_provinces_by_dissolving_districts")
+
+    # Get distinct provinces from district metadata
+    province_names = await conn.fetch("""
+        SELECT DISTINCT meta->>'province' AS province
+        FROM admin_boundaries
+        WHERE level = 6
+        ORDER BY province
+    """)
+
+    inserted = 0
+    for row in province_names:
+        prov_name = row["province"]
+        if prov_name == "Unknown":
+            continue
+
+        # Create province geometry as union of its districts
+        await conn.execute("""
+            INSERT INTO admin_boundaries (name, name_si, level, geom, meta)
+            SELECT
+                $1,
+                $2,
+                4,
+                ST_Multi(ST_Union(geom)),
+                $3::jsonb
+            FROM admin_boundaries
+            WHERE level = 6
+              AND meta->>'province' = $1
+        """,
+            prov_name,
+            PROVINCE_SINHALA.get(prov_name),
+            json.dumps({"source": "dissolved_from_districts"}),
+        )
+        inserted += 1
+
+    log.info("provinces_created", count=inserted)
+    return inserted
+
+
+async def link_district_parents(conn: asyncpg.Connection) -> int:
+    """Set parent_id on all districts to point to their province record."""
+    updated = await conn.execute("""
+        UPDATE admin_boundaries d
+        SET parent_id = p.id
+        FROM admin_boundaries p
+        WHERE d.level = 6
+          AND p.level = 4
+          AND p.name = d.meta->>'province'
+          AND d.parent_id IS NULL
+    """)
+    count = int(updated.split()[-1])
+    log.info("district_parent_links_set", count=count)
+    return count
+
+
+async def load_ds_divisions(conn: asyncpg.Connection, geojson_path: Path) -> int:
+    """Load GADM Level 2 (DS Divisions) as admin level 7. Optional."""
+    log.info("loading_ds_divisions", file=geojson_path.name)
+
+    with open(geojson_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    features = data.get("features", [])
+    inserted = 0
+
+    for feature in features:
+        props = feature.get("properties", {})
+        geom  = feature.get("geometry")
+        if not geom:
+            continue
+
+        name         = props.get("NAME_2", "").strip()
+        gid          = props.get("GID_2", "")
+        district_gid = props.get("GID_1", "")
+
+        # Find parent district by GID
+        parent_id = await conn.fetchval(
+            "SELECT id FROM admin_boundaries WHERE meta->>'gid' = $1 AND level = 6",
+            district_gid,
+        )
+
+        mp_geom = ensure_multipolygon(geom)
+
+        await conn.execute("""
+            INSERT INTO admin_boundaries (name, level, geom, parent_id, meta)
+            VALUES ($1, 7, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326), $3, $4::jsonb)
+            ON CONFLICT DO NOTHING
+        """,
+            name,
+            json.dumps(mp_geom),
+            parent_id,
+            json.dumps({"gid": gid}),
+        )
+        inserted += 1
+
+        if inserted % 50 == 0:
+            log.info("ds_division_progress", loaded=inserted, total=len(features))
+
+    log.info("ds_divisions_loaded", count=inserted)
     return inserted
 
 
 async def validate_load(conn: asyncpg.Connection) -> bool:
-    """Run post-load validation. Returns True if all checks pass."""
     ok = True
 
     province_count = await conn.fetchval(
@@ -175,17 +275,16 @@ async def validate_load(conn: asyncpg.Connection) -> bool:
     else:
         log.info("districts_ok", count=district_count)
 
-    # Check every district has a parent province
-    orphan_districts = await conn.fetchval("""
+    orphans = await conn.fetchval("""
         SELECT COUNT(*) FROM admin_boundaries d
         WHERE d.level = 6
           AND NOT EXISTS (
-            SELECT 1 FROM admin_boundaries p
-            WHERE p.level = 4 AND p.id = d.parent_id
+              SELECT 1 FROM admin_boundaries p
+              WHERE p.level = 4 AND p.id = d.parent_id
           )
     """)
-    if orphan_districts > 0:
-        log.error("orphan_districts", count=orphan_districts)
+    if orphans > 0:
+        log.error("orphan_districts", count=orphans)
         ok = False
     else:
         log.info("district_parent_links_ok")
@@ -193,51 +292,53 @@ async def validate_load(conn: asyncpg.Connection) -> bool:
     return ok
 
 
-async def main(level1_path: Path, level2_path: Path) -> None:
+async def main(level1_path: Path, level2_path: Path | None) -> None:
     log.info("connecting_to_db", url=settings.database_url.split("@")[-1])
     pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=3)
 
     async with pool.acquire() as conn:
-        # Clear existing admin boundaries for idempotent re-run
         existing = await conn.fetchval("SELECT COUNT(*) FROM admin_boundaries")
         if existing > 0:
             log.info("clearing_existing_boundaries", count=existing)
             await conn.execute("DELETE FROM admin_boundaries")
-            # Reset serial sequence
             await conn.execute("ALTER SEQUENCE admin_boundaries_id_seq RESTART WITH 1")
 
-        # Load provinces first (districts reference them)
-        province_name_to_id: dict[str, int] = {}
-        prov_count = await load_level(conn, level1_path, 1, province_name_to_id)
-        log.info("provinces_loaded", count=prov_count)
+        # Step 1: Load districts (level 6)
+        await load_districts(conn, level1_path)
 
-        dist_count = await load_level(conn, level2_path, 2, province_name_to_id)
-        log.info("districts_loaded", count=dist_count)
+        # Step 2: Create provinces by dissolving districts (level 4)
+        await create_provinces_from_districts(conn)
+
+        # Step 3: Link districts → provinces
+        await link_district_parents(conn)
+
+        # Step 4 (optional): Load DS Divisions (level 7)
+        if level2_path:
+            await load_ds_divisions(conn, level2_path)
 
         ok = await validate_load(conn)
         if not ok:
             log.error("admin_boundary_load_FAILED")
+            await pool.close()
             sys.exit(1)
 
-        log.info("admin_boundary_load_complete",
-                 provinces=prov_count, districts=dist_count)
-
+    log.info("admin_boundary_load_complete")
     await pool.close()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Load GADM admin boundaries into PostGIS")
+    parser = argparse.ArgumentParser(description="Load Sri Lanka admin boundaries into PostGIS")
     parser.add_argument("--level1", required=True, type=Path,
-                        help="Path to GADM Level 1 GeoJSON (Provinces)")
-    parser.add_argument("--level2", required=True, type=Path,
-                        help="Path to GADM Level 2 GeoJSON (Districts)")
+                        help="GADM Level 1 GeoJSON — 25 Districts (gadm41_LKA_1.json)")
+    parser.add_argument("--level2", required=False, type=Path, default=None,
+                        help="GADM Level 2 GeoJSON — DS Divisions (gadm41_LKA_2.json, optional)")
     args = parser.parse_args()
 
     if not args.level1.exists():
-        print(f"ERROR: Level 1 file not found: {args.level1}", file=sys.stderr)
+        print(f"ERROR: File not found: {args.level1}", file=sys.stderr)
         sys.exit(1)
-    if not args.level2.exists():
-        print(f"ERROR: Level 2 file not found: {args.level2}", file=sys.stderr)
+    if args.level2 and not args.level2.exists():
+        print(f"ERROR: File not found: {args.level2}", file=sys.stderr)
         sys.exit(1)
 
     asyncio.run(main(args.level1, args.level2))

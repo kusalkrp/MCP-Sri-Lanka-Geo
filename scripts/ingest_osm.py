@@ -386,18 +386,21 @@ async def run_dedup(conn: asyncpg.Connection) -> int:
     """
     log.info("running_dedup_pass")
 
-    # Find node/way pairs: same name (trigram similarity), within 50m
+    # LATERAL join: for each of the ~250 ways, use the GIST index to find nearby nodes.
+    # Uses geometry-based ST_DWithin (0.00045° ≈ 50m at SL latitude) to keep the GIST
+    # index on geom(Point,4326) active. Geography cast would bypass the index.
     duplicates = await conn.fetch("""
-        SELECT a.id AS node_id
-        FROM pois a
-        JOIN pois b ON (
-            b.osm_type = 'way'
-            AND a.osm_type = 'node'
-            AND similarity(a.name, b.name) > 0.9
-            AND ST_DWithin(a.geom::geography, b.geom::geography, 50)
-            AND b.deleted_at IS NULL
-        )
-        WHERE a.deleted_at IS NULL
+        SELECT b_node.id AS node_id
+        FROM pois b
+        JOIN LATERAL (
+            SELECT a.id
+            FROM pois a
+            WHERE a.osm_type = 'node'
+              AND a.deleted_at IS NULL
+              AND ST_DWithin(a.geom, b.geom, 0.00045)
+              AND similarity(a.name, b.name) > 0.9
+        ) b_node ON true
+        WHERE b.osm_type = 'way' AND b.deleted_at IS NULL
     """)
 
     if not duplicates:
