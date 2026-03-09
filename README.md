@@ -140,22 +140,297 @@ mcp-srilanka-geo/
 
 ## MCP Tools
 
-The tool surface is registered from [app/tools/__init__.py](/g:/MCP-Sri-Lanka-Geo/app/tools/__init__.py).
+All 12 tools are registered from [app/tools/__init__.py](/g:/MCP-Sri-Lanka-Geo/app/tools/__init__.py). Every tool validates Sri Lanka bounds before touching the database, returns a structured `{"error": "..."}` on failure instead of raising, and logs `duration_ms` and `result_count` on every call. Results are cached in Redis with per-tool TTLs.
 
-| Tool | Purpose |
-|---|---|
-| `find_nearby` | Radius-based nearby POI search with optional category filter |
-| `get_poi_details` | Retrieve a single POI by OSM-prefixed ID |
-| `get_administrative_area` | Reverse-geocode a point to district, province, and optional DS division |
-| `validate_coordinates` | Check if coordinates fall inside Sri Lanka bounds |
-| `get_coverage_stats` | Read precomputed POI counts from `category_stats` |
-| `search_pois` | Hybrid semantic + spatial search using PostGIS + Gemini + Qdrant |
-| `list_categories` | Category and subcategory inventory with counts |
-| `get_business_density` | Category distribution within a radius |
-| `route_between` | Straight-line distance and bearing between POIs |
-| `find_universities` | Nearby higher education entities |
-| `find_agricultural_zones` | Nearby agricultural land-use entities |
-| `find_businesses_near` | Nearby businesses and commercial amenities |
+---
+
+### 1. `find_nearby`
+
+The general-purpose proximity search. Given a coordinate and radius, it returns all POIs within that distance sorted by closeness.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `lat` | float | required | Latitude (5.85 – 9.9) |
+| `lng` | float | required | Longitude (79.5 – 81.9) |
+| `radius_km` | float | 5.0 | Search radius, max 100 km |
+| `category` | string | — | OSM category filter, e.g. `amenity`, `shop`, `tourism` |
+| `subcategory` | string | — | OSM subcategory filter, e.g. `hospital`, `bank`, `restaurant` |
+| `limit` | int | 20 | Max results, max 100 |
+
+**Returns** `{total, results[{id, name, name_si, category, subcategory, lat, lng, distance_m, address, quality_score}]}`
+
+**Example questions an agent would answer with this tool**
+- *"Find hospitals within 3 km of Colombo Fort"*
+- *"What petrol stations are near Kandy city centre?"*
+- *"Show me all ATMs within 1 km of my location"*
+
+---
+
+### 2. `get_poi_details`
+
+Fetches the complete record for a single POI by its OSM-prefixed ID. Used when an agent needs full metadata — address, tags, Wikidata ID, enrichment data — after finding a POI ID from another tool.
+
+**Parameters**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `poi_id` | string | OSM-prefixed ID: `n12345678` (node), `w67890` (way), `r111` (relation) |
+
+**Returns** Full POI record including `name`, `name_si`, `name_ta`, `category`, `subcategory`, `address`, `tags`, `wikidata_id`, `geonames_id`, `enrichment`, `data_source`, `quality_score`, `last_osm_sync`.
+
+**Cached for 24 hours** per POI ID.
+
+**Example questions**
+- *"Tell me everything about POI n12345678"*
+- *"What are the opening hours for this hospital?"* (after another tool returned the ID)
+
+---
+
+### 3. `get_administrative_area`
+
+Reverse-geocodes a coordinate to its Sri Lanka administrative hierarchy. Uses PostGIS `ST_Contains` against loaded GADM boundary polygons, with a nearest-boundary fallback for coastal and edge points (harbours, piers, lighthouses).
+
+**Parameters**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `lat` | float | Latitude (5.85 – 9.9) |
+| `lng` | float | Longitude (79.5 – 81.9) |
+
+**Returns** `{district, province, ds_division}` — `ds_division` is null if DS Division data was not loaded.
+
+**Cached for 7 days** — administrative boundaries change rarely.
+
+**Example questions**
+- *"What district is this coordinate in?"*
+- *"Which province does the area at 7.29, 80.63 belong to?"*
+- *"Is this location in the Northern Province?"*
+
+---
+
+### 4. `validate_coordinates`
+
+Checks whether a lat/lng pair falls inside Sri Lanka's bounding box (5.85–9.9 N, 79.5–81.9 E) and rejects the OSM null-island coordinate (0, 0). Intended as a lightweight pre-check an agent can call before building a query.
+
+**Parameters**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `lat` | float | Latitude to validate |
+| `lng` | float | Longitude to validate |
+
+**Returns** `{valid: bool, lat, lng, message}` — if invalid, also returns `bounds` with the valid range.
+
+**Example questions**
+- *"Are these coordinates inside Sri Lanka?"*
+- *"Check if 6.93, 79.84 is a valid Sri Lanka location"*
+
+---
+
+### 5. `get_coverage_stats`
+
+Returns pre-computed POI counts by category and subcategory — either nationally or for a specific district. Reads from the `category_stats` table which is refreshed after every pipeline run. Never aggregates the live `pois` table at request time.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `district` | string | — | District name, e.g. `Colombo`, `Kandy`, or omit for national totals |
+
+**Returns** `{district_filter, total_pois, categories[{category, subcategory, poi_count}]}`
+
+**Cached for 6 hours.**
+
+**Example questions**
+- *"How many POIs does the dataset have in total?"*
+- *"What types of places are recorded in Galle district?"*
+- *"How many schools are in the Jaffna district?"*
+
+---
+
+### 6. `search_pois`
+
+The most powerful tool. Runs a two-stage hybrid search: PostGIS spatial pre-filter to limit candidates by geography, followed by Gemini semantic embedding and Qdrant cosine similarity ranking. The result is semantically ranked and distance-annotated.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `query` | string | required | Natural-language search, e.g. `"Buddhist temple"`, `"seafood restaurant"` |
+| `lat` | float | — | Optional latitude — constrains results to a radius |
+| `lng` | float | — | Optional longitude |
+| `radius_km` | float | 10.0 | Radius to apply when coordinates are given, max 100 km |
+| `category` | string | — | Optional category filter applied at the Qdrant stage |
+| `limit` | int | 10 | Max results, max 50 |
+
+**How it works**
+
+1. If coordinates are given, PostGIS returns up to 500 candidate IDs within the radius. If zero candidates are found, the tool returns empty immediately — it never falls back to an unconstrained global search.
+2. The query string is embedded with Gemini `text-embedding-004` (768-dim). Query embeddings are themselves cached in Redis to avoid re-embedding identical queries.
+3. Qdrant performs cosine similarity search, filtered to the candidate IDs from step 1 (or global if no coordinates given).
+4. Results include both `semantic_score` (Qdrant cosine) and `distance_m` (from the spatial pre-filter).
+
+**Returns** `{query, total, results[{poi_id, name, name_si, category, subcategory, district, province, lat, lng, semantic_score, distance_m}]}`
+
+**Example questions**
+- *"Find Buddhist temples near Kandy"*
+- *"Search for seafood restaurants in Galle"*
+- *"Which hospitals near Colombo have maternity services?"*
+- *"Find irrigation infrastructure in the North Central Province"*
+
+---
+
+### 7. `list_categories`
+
+Returns the full inventory of category and subcategory combinations that exist in the dataset, with counts. Useful for agents to discover what kinds of POIs are available before constructing a more specific query.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `district` | string | — | District name, or omit for the national list |
+
+**Returns** `{district_filter, total_categories, categories[{category, subcategory, poi_count}]}`
+
+**Cached for 6 hours.**
+
+**Example questions**
+- *"What categories of places does this dataset cover?"*
+- *"What types of shops are recorded in Colombo?"*
+- *"List all subcategories under amenity"*
+
+---
+
+### 8. `get_business_density`
+
+Aggregates the category breakdown of all POIs within a given radius of a point. Useful for site analysis — understanding what mix of businesses surrounds a location.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `lat` | float | required | Latitude (5.85 – 9.9) |
+| `lng` | float | required | Longitude (79.5 – 81.9) |
+| `radius_km` | float | 2.0 | Radius, max 50 km |
+
+**Returns** `{lat, lng, radius_km, total_pois, breakdown[{category, subcategory, poi_count}]}`
+
+**Cached for 1 hour.**
+
+**Example questions**
+- *"What is the business mix within 2 km of this Colombo address?"*
+- *"How many restaurants versus banks are near our proposed store site?"*
+- *"Analyse the commercial density around Galle Face Green"*
+
+---
+
+### 9. `route_between`
+
+Computes the straight-line (as-the-crow-flies) distance and compass bearing between two POIs identified by their OSM IDs. Validates that both POIs exist and are not soft-deleted before computing.
+
+**Parameters**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `origin_poi_id` | string | OSM-prefixed ID of the starting POI |
+| `dest_poi_id` | string | OSM-prefixed ID of the destination POI |
+
+**Returns** `{origin{poi_id, name, lat, lng}, destination{...}, distance_m, distance_km, bearing_deg, note}`
+
+**Note:** v1 provides straight-line distance only. Road routing is not available in this version.
+
+**Example questions**
+- *"How far is Nawaloka Hospital from Colombo Fort railway station?"*
+- *"What is the distance between the University of Peradeniya and Kandy city centre?"*
+
+---
+
+### 10. `find_universities`
+
+Finds higher education institutions near a coordinate. Covers the three OSM tag combinations confirmed present in the Sri Lanka dataset: `amenity=university`, `amenity=college`, and `office=educational_institution`.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `lat` | float | required | Latitude (5.85 – 9.9) |
+| `lng` | float | required | Longitude (79.5 – 81.9) |
+| `radius_km` | float | 20.0 | Search radius, max 100 km |
+| `limit` | int | 20 | Max results, max 100 |
+
+**Returns** `{total, results[{id, name, name_si, category, subcategory, lat, lng, distance_m, address, quality_score}]}`
+
+**Example questions**
+- *"What universities are within 20 km of Kandy?"*
+- *"Find all colleges near Jaffna"*
+- *"Which higher education institutions are in the Western Province?"*
+
+---
+
+### 11. `find_agricultural_zones`
+
+Finds agricultural land-use areas near a coordinate. Covers OSM landuse tags confirmed in the Sri Lanka dataset: `farmland`, `orchard`, `greenhouse`, `aquaculture`, `vineyard`, and `reservoir`.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `lat` | float | required | Latitude (5.85 – 9.9) |
+| `lng` | float | required | Longitude (79.5 – 81.9) |
+| `radius_km` | float | 10.0 | Search radius, max 100 km |
+| `limit` | int | 20 | Max results, max 100 |
+
+**Returns** `{total, results[{id, name, name_si, subcategory, lat, lng, distance_m, address, tags}]}`
+
+**Example questions**
+- *"What farmland is recorded near Anuradhapura?"*
+- *"Find irrigation reservoirs within 15 km of Polonnaruwa"*
+- *"What agricultural zones are near this proposed agri-project site?"*
+
+---
+
+### 12. `find_businesses_near`
+
+Finds commercial businesses near a coordinate. Covers shops (`shop/*`), offices, and commercial amenities — restaurants, banks, pharmacies, supermarkets, fuel stations, cafes, ATMs, and more. Accepts an optional `business_type` filter to narrow by subcategory.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `lat` | float | required | Latitude (5.85 – 9.9) |
+| `lng` | float | required | Longitude (79.5 – 81.9) |
+| `radius_km` | float | 5.0 | Search radius, max 100 km |
+| `business_type` | string | — | Subcategory filter, e.g. `restaurant`, `bank`, `pharmacy`, `supermarket`, `fuel`, `cafe`, `atm` |
+| `limit` | int | 20 | Max results, max 100 |
+
+**Returns** `{total, business_type_filter, results[{id, name, name_si, category, subcategory, lat, lng, distance_m, address}]}`
+
+**Example questions**
+- *"Find all banks within 1 km of our Kandy office"*
+- *"What restaurants are near Galle Fort?"*
+- *"Locate the nearest pharmacy to this address"*
+- *"Show all supermarkets within 3 km"*
+
+---
+
+### Quick reference
+
+| # | Tool | Primary use | Backed by | Cache TTL |
+|---|---|---|---|---|
+| 1 | `find_nearby` | General proximity search | PostGIS `ST_DWithin` | 30 min |
+| 2 | `get_poi_details` | Full record by ID | PostGIS | 24 h |
+| 3 | `get_administrative_area` | Reverse geocoding | PostGIS `ST_Contains` | 7 d |
+| 4 | `validate_coordinates` | Bounds check | In-memory | — |
+| 5 | `get_coverage_stats` | National/district POI counts | `category_stats` table | 6 h |
+| 6 | `search_pois` | Semantic + spatial hybrid search | PostGIS + Gemini + Qdrant | 30 min |
+| 7 | `list_categories` | Discover available categories | `category_stats` table | 6 h |
+| 8 | `get_business_density` | Business mix analysis | PostGIS aggregation | 1 h |
+| 9 | `route_between` | Distance between two POIs | PostGIS `ST_Distance` | — |
+| 10 | `find_universities` | Higher education near point | PostGIS + tag filter | 30 min |
+| 11 | `find_agricultural_zones` | Agricultural land near point | PostGIS + tag filter | 30 min |
+| 12 | `find_businesses_near` | Commercial search with type filter | PostGIS + tag filter | 30 min |
 
 ## Core Design Rules Reflected In Code
 
@@ -328,6 +603,145 @@ docker exec mcp-srilanka-geo bash -c "cd /app && python scripts/refresh_category
 docker exec mcp-srilanka-geo bash -c "cd /app && python scripts/validate_dataset.py"
 docker exec mcp-srilanka-geo bash -c "cd /app && python scripts/reconcile_qdrant.py"
 ```
+
+## Run Locally with Docker
+
+The simplest way to run the full stack on your own machine. Docker handles every service — database, vector store, cache, and the app itself. The built-in scheduler downloads the Sri Lanka dataset and runs the data pipeline automatically on first boot, so there is nothing to configure beyond a Gemini API key.
+
+### What you need
+
+| Requirement | Notes |
+|---|---|
+| Docker Desktop | [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop) — installs everything |
+| Git | To clone the repo |
+| Gemini API key | Free tier is enough — used for semantic embeddings |
+| ~1 GB free RAM | Postgres + Qdrant + Redis + app running together |
+| ~1 GB free disk | Database data, vector store, downloaded OSM files |
+
+### Step 1 — Clone and configure
+
+```bash
+git clone https://github.com/your-org/mcp-srilanka-geo.git
+cd mcp-srilanka-geo
+cp .env.example .env
+```
+
+Open `.env` and fill in the following. Everything else can stay as the default placeholder:
+
+```bash
+GEMINI_API_KEY=your-gemini-api-key-here
+
+# Generate these three with:  python -c "import secrets; print(secrets.token_hex(24))"
+DB_PASSWORD=replace_with_random_string
+REDIS_PASSWORD=replace_with_random_string
+API_KEYS=replace_with_random_string_at_least_32_chars
+```
+
+Update the connection strings in `.env` so the passwords match:
+
+```bash
+DATABASE_URL=postgresql://srilanka_app:YOUR_DB_PASSWORD@postgres:5432/srilanka_geo
+REDIS_URL=redis://:YOUR_REDIS_PASSWORD@redis:6379
+```
+
+### Step 2 — Start everything
+
+```bash
+docker compose up -d
+```
+
+This starts five containers: `postgres`, `qdrant`, `redis`, `app`, and `scheduler`. The scheduler immediately begins downloading the Sri Lanka OSM dataset and boundary files, then runs the full data pipeline automatically.
+
+Check that all containers are running:
+
+```bash
+docker compose ps
+```
+
+### Step 3 — Wait for the first pipeline run
+
+The scheduler downloads data and processes it on first boot. This takes time:
+
+| Stage | Approximate duration |
+|---|---|
+| Download OSM PBF (~70 MB) | 2–5 min |
+| Ingest OSM into PostGIS | 5–10 min |
+| Spatial district/province backfill | 2–3 min |
+| Generate Gemini embeddings (50 k POIs) | **30–60 min** |
+| **Total first run** | **40–75 min** |
+
+Watch progress in the scheduler logs:
+
+```bash
+docker compose logs -f scheduler
+```
+
+Once you see `pipeline completed successfully`, the server is ready.
+
+### Step 4 — Verify
+
+```bash
+curl http://localhost:8080/health
+```
+
+All three dependencies should show `ok`:
+
+```json
+{"version":"1.0.0","dependencies":{"postgis":"ok","qdrant":"ok","redis":"ok"}}
+```
+
+### Connecting from Claude Desktop
+
+Add this block to your Claude Desktop config file:
+
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "srilanka-geo": {
+      "command": "docker",
+      "args": ["exec", "-i", "mcp-srilanka-geo", "python", "-m", "app.main", "stdio"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. The **srilanka-geo** tools will appear automatically. No API key needed for local stdio connections.
+
+### Connecting from Antigravity or another SSE client
+
+The SSE endpoint is available locally at `http://localhost:8080/sse`. Cloud-based apps like Antigravity cannot reach `localhost` directly — you need to expose it with a tunnel:
+
+```bash
+# Install ngrok from ngrok.com, then:
+ngrok http 8080
+```
+
+ngrok prints a public HTTPS URL like `https://abc123.ngrok-free.app`. Use that URL in your client:
+
+```
+Transport:  SSE
+URL:        https://abc123.ngrok-free.app/sse
+Header:     X-API-Key: <value of API_KEYS from your .env>
+```
+
+The ngrok URL changes every time you restart it. For a permanent URL, deploy to a server instead (see [Deployment](#deployment)).
+
+### Stopping and restarting
+
+```bash
+# Stop all containers (data is preserved in Docker volumes)
+docker compose down
+
+# Start again — pipeline does NOT re-run (data already loaded)
+docker compose up -d
+```
+
+Data persists in Docker named volumes between restarts. The scheduler only re-downloads the OSM file when Geofabrik publishes a new version (detected via checksum), then re-runs the pipeline automatically every `PIPELINE_SCHEDULE_DAYS` days (default: 7).
+
+---
 
 ## How to Connect
 
