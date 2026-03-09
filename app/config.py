@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     # which breaks comma-separated values. Parse via the api_keys_list property instead.
     api_keys: str = ""
     require_auth: bool = True
+    # Admin key for /admin/* endpoints. Must be >= 32 chars. If empty, admin endpoints return 403.
+    admin_key: str = ""
 
     # App
     app_version: str = "1.0.0"

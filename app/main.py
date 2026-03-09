@@ -21,6 +21,8 @@ Auth rules:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import secrets
 import sys
 from contextlib import asynccontextmanager
@@ -32,6 +34,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
+
+import redis.asyncio as aioredis
 
 from app.cache import redis_cache
 from app.config import settings
@@ -135,6 +139,239 @@ async def health() -> JSONResponse:
     )
 
 
+# ── API key verification (shared by SSE, pipeline endpoints) ─────────────────
+
+def _hash_key(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _verify_env_key(provided: str) -> bool:
+    """Check against keys in .env (existing consumers)."""
+    return any(
+        secrets.compare_digest(provided, valid)
+        for valid in settings.api_keys_list
+    )
+
+
+async def _verify_db_key(provided: str) -> bool:
+    """Check against self-registered keys in api_keys table."""
+    key_hash = _hash_key(provided)
+    try:
+        pool = postgis.get_pool()
+        row = await pool.fetchrow(
+            "SELECT id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
+            key_hash,
+        )
+        if row:
+            # Fire-and-forget usage tracking
+            asyncio.create_task(pool.execute(
+                """UPDATE api_keys
+                   SET last_used_at = NOW(), request_count = request_count + 1
+                   WHERE id = $1""",
+                row["id"],
+            ))
+            return True
+    except Exception:
+        pass  # DB unavailable — fall through to deny
+    return False
+
+
+async def _verify_api_key(provided: str) -> bool:
+    """Check env keys first (fast), then DB keys."""
+    if not provided:
+        return False
+    if _verify_env_key(provided):
+        return True
+    return await _verify_db_key(provided)
+
+
+def _verify_admin_key(provided: str) -> bool:
+    """Admin key check — used for /admin/* endpoints only."""
+    if not settings.admin_key or len(settings.admin_key) < 32:
+        return False
+    return secrets.compare_digest(provided, settings.admin_key)
+
+
+# ── Pipeline status + trigger endpoints ──────────────────────────────────────
+
+_PIPELINE_TRIGGER_KEY = "pipeline:manual_trigger"
+
+
+@app.get("/pipeline/status")
+async def pipeline_status(request: Request) -> JSONResponse:
+    """
+    Returns the last 5 pipeline runs from pipeline_runs table.
+    Requires X-API-Key header (same keys as SSE).
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if not await _verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    try:
+        pool = postgis.get_pool()
+        rows = await pool.fetch("""
+            SELECT id, run_type, started_at, completed_at, status,
+                   stats, error_message
+            FROM pipeline_runs
+            ORDER BY started_at DESC
+            LIMIT 5
+        """)
+        runs = [
+            {
+                "id": r["id"],
+                "run_type": r["run_type"],
+                "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+                "status": r["status"],
+                "stats": r["stats"],
+                "error_message": r["error_message"],
+            }
+            for r in rows
+        ]
+        return JSONResponse({"runs": runs})
+    except Exception:
+        log.error("pipeline_status_error", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch pipeline status")
+
+
+@app.post("/pipeline/trigger")
+async def pipeline_trigger(request: Request) -> JSONResponse:
+    """
+    Signal the scheduler to run the pipeline immediately.
+    Sets Redis key  pipeline:manual_trigger = 1  — the scheduler wakes within 60s.
+    Requires X-API-Key header.
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if not await _verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    try:
+        r: aioredis.Redis = redis_cache.get_redis()
+        await r.set(_PIPELINE_TRIGGER_KEY, "1", ex=3600)  # expires in 1h if not consumed
+        log.info("pipeline_trigger_requested")
+        return JSONResponse({"triggered": True, "message": "Scheduler will start pipeline within 60s"})
+    except Exception:
+        log.error("pipeline_trigger_error", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to set trigger (Redis unavailable?)")
+
+
+# ── Self-service key registration ────────────────────────────────────────────
+
+@app.post("/keys/register", status_code=201)
+async def register_key(request: Request) -> JSONResponse:
+    """
+    Register a new API key instantly. No approval required.
+
+    Body (JSON):
+        app_name  — name of your application (required)
+        contact   — your email or name (required)
+        use_case  — what you're building (optional)
+
+    Returns the API key once. Store it securely — it cannot be retrieved again.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
+
+    app_name = (body.get("app_name") or "").strip()
+    contact  = (body.get("contact")  or "").strip()
+    use_case = (body.get("use_case") or "").strip() or None
+
+    if not app_name:
+        raise HTTPException(status_code=400, detail="app_name is required")
+    if not contact:
+        raise HTTPException(status_code=400, detail="contact is required")
+    if len(app_name) > 100 or len(contact) > 200:
+        raise HTTPException(status_code=400, detail="app_name/contact too long")
+
+    raw_key    = secrets.token_hex(32)          # 64-char hex key
+    key_hash   = _hash_key(raw_key)
+    key_prefix = raw_key[:16]                   # shown in admin list for identification
+
+    try:
+        pool = postgis.get_pool()
+        await pool.execute(
+            """INSERT INTO api_keys (key_hash, key_prefix, app_name, contact, use_case)
+               VALUES ($1, $2, $3, $4, $5)""",
+            key_hash, key_prefix, app_name, contact, use_case,
+        )
+    except Exception as exc:
+        if "unique" in str(exc).lower():
+            # Astronomically unlikely but handle cleanly
+            raise HTTPException(status_code=409, detail="Key collision — try again")
+        log.error("register_key_error", error=repr(exc))
+        raise HTTPException(status_code=500, detail="Failed to register key")
+
+    log.info("api_key_registered", app_name=app_name, prefix=key_prefix)
+    return JSONResponse({
+        "api_key":  raw_key,
+        "prefix":   key_prefix,
+        "app_name": app_name,
+        "warning":  "Save this key now — it will never be shown again.",
+        "usage":    "Add header  X-API-Key: <your-key>  to every request.",
+    }, status_code=201)
+
+
+# ── Admin key management ──────────────────────────────────────────────────────
+
+@app.get("/admin/keys")
+async def admin_list_keys(request: Request) -> JSONResponse:
+    """
+    List all registered API keys (active and revoked).
+    Requires X-Admin-Key header.
+    """
+    if not _verify_admin_key(request.headers.get("X-Admin-Key", "")):
+        raise HTTPException(status_code=401, detail="Invalid or missing admin key")
+
+    pool = postgis.get_pool()
+    rows = await pool.fetch("""
+        SELECT id, key_prefix, app_name, contact, use_case,
+               created_at, last_used_at, revoked_at, request_count
+        FROM api_keys
+        ORDER BY created_at DESC
+    """)
+    keys = [
+        {
+            "id":            r["id"],
+            "key_prefix":    r["key_prefix"] + "...",
+            "app_name":      r["app_name"],
+            "contact":       r["contact"],
+            "use_case":      r["use_case"],
+            "created_at":    r["created_at"].isoformat(),
+            "last_used_at":  r["last_used_at"].isoformat() if r["last_used_at"] else None,
+            "revoked_at":    r["revoked_at"].isoformat() if r["revoked_at"] else None,
+            "request_count": r["request_count"],
+            "status":        "revoked" if r["revoked_at"] else "active",
+        }
+        for r in rows
+    ]
+    return JSONResponse({"total": len(keys), "keys": keys})
+
+
+@app.delete("/admin/keys/{key_id}")
+async def admin_revoke_key(key_id: int, request: Request) -> JSONResponse:
+    """
+    Revoke an API key by its numeric ID.
+    Requires X-Admin-Key header.
+    """
+    if not _verify_admin_key(request.headers.get("X-Admin-Key", "")):
+        raise HTTPException(status_code=401, detail="Invalid or missing admin key")
+
+    pool = postgis.get_pool()
+    result = await pool.execute(
+        "UPDATE api_keys SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL",
+        key_id,
+    )
+    # asyncpg returns "UPDATE N" — check N
+    updated = int(result.split()[-1])
+    if updated == 0:
+        raise HTTPException(status_code=404, detail=f"Key {key_id} not found or already revoked")
+
+    log.info("api_key_revoked", key_id=key_id)
+    return JSONResponse({"revoked": True, "key_id": key_id})
+
+
 # ── SSE transport — ALWAYS requires auth ─────────────────────────────────────
 
 # SseServerTransport handles the SSE <-> MCP protocol bridge.
@@ -142,18 +379,11 @@ async def health() -> JSONResponse:
 _sse_transport = SseServerTransport("/messages/")
 
 
-def _verify_api_key(provided: str) -> bool:
-    return any(
-        secrets.compare_digest(provided, valid)
-        for valid in settings.api_keys_list
-    )
-
-
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     """SSE transport for BizMind AI and other network clients."""
     api_key = request.headers.get("X-API-Key", "")
-    if not _verify_api_key(api_key):
+    if not await _verify_api_key(api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     async with _sse_transport.connect_sse(
