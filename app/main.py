@@ -33,6 +33,8 @@ from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 
+import redis.asyncio as aioredis
+
 from app.cache import redis_cache
 from app.config import settings
 from app.db import postgis
@@ -135,18 +137,83 @@ async def health() -> JSONResponse:
     )
 
 
-# ── SSE transport — ALWAYS requires auth ─────────────────────────────────────
-
-# SseServerTransport handles the SSE <-> MCP protocol bridge.
-# Messages are posted to /messages/ (trailing slash is part of the mount path).
-_sse_transport = SseServerTransport("/messages/")
-
+# ── API key verification (shared by SSE, pipeline endpoints) ─────────────────
 
 def _verify_api_key(provided: str) -> bool:
     return any(
         secrets.compare_digest(provided, valid)
         for valid in settings.api_keys_list
     )
+
+
+# ── Pipeline status + trigger endpoints ──────────────────────────────────────
+
+_PIPELINE_TRIGGER_KEY = "pipeline:manual_trigger"
+
+
+@app.get("/pipeline/status")
+async def pipeline_status(request: Request) -> JSONResponse:
+    """
+    Returns the last 5 pipeline runs from pipeline_runs table.
+    Requires X-API-Key header (same keys as SSE).
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if not _verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    try:
+        pool = postgis.get_pool()
+        rows = await pool.fetch("""
+            SELECT id, run_type, started_at, completed_at, status,
+                   stats, error_message
+            FROM pipeline_runs
+            ORDER BY started_at DESC
+            LIMIT 5
+        """)
+        runs = [
+            {
+                "id": r["id"],
+                "run_type": r["run_type"],
+                "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+                "status": r["status"],
+                "stats": r["stats"],
+                "error_message": r["error_message"],
+            }
+            for r in rows
+        ]
+        return JSONResponse({"runs": runs})
+    except Exception:
+        log.error("pipeline_status_error", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch pipeline status")
+
+
+@app.post("/pipeline/trigger")
+async def pipeline_trigger(request: Request) -> JSONResponse:
+    """
+    Signal the scheduler to run the pipeline immediately.
+    Sets Redis key  pipeline:manual_trigger = 1  — the scheduler wakes within 60s.
+    Requires X-API-Key header.
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    if not _verify_api_key(api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    try:
+        r: aioredis.Redis = redis_cache.get_redis()
+        await r.set(_PIPELINE_TRIGGER_KEY, "1", ex=3600)  # expires in 1h if not consumed
+        log.info("pipeline_trigger_requested")
+        return JSONResponse({"triggered": True, "message": "Scheduler will start pipeline within 60s"})
+    except Exception:
+        log.error("pipeline_trigger_error", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to set trigger (Redis unavailable?)")
+
+
+# ── SSE transport — ALWAYS requires auth ─────────────────────────────────────
+
+# SseServerTransport handles the SSE <-> MCP protocol bridge.
+# Messages are posted to /messages/ (trailing slash is part of the mount path).
+_sse_transport = SseServerTransport("/messages/")
 
 
 @app.get("/sse")

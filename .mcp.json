@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "srilanka-geo": {
+      "command": "python",
+      "args": ["-m", "app.main", "stdio"],
+      "cwd": "G:\\MCP-Sri-Lanka-Geo",
+      "env": {
+        "DATABASE_URL": "postgresql://postgres:srilankageo2026@localhost:5433/srilanka_geo",
+        "QDRANT_URL": "http://localhost:6333",
+        "REDIS_URL": "redis://:be4f14f8e1d24f5b2c71e6bd1d7266d0d2a04b1ad8d1b52c@localhost:6379"
+      }
+    }
+  }
+}

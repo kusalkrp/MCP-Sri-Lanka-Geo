@@ -329,6 +329,123 @@ docker exec mcp-srilanka-geo bash -c "cd /app && python scripts/validate_dataset
 docker exec mcp-srilanka-geo bash -c "cd /app && python scripts/reconcile_qdrant.py"
 ```
 
+## How to Connect
+
+This server speaks the **Model Context Protocol (MCP)**. Any AI agent or tool that supports MCP can connect to it and use all 12 tools automatically — no custom integration code needed.
+
+There are two ways to connect depending on where your agent runs.
+
+---
+
+### Option A — Claude Desktop (local, no API key needed)
+
+Claude Desktop connects over **stdio** — it just launches the server as a local process. No network, no API key.
+
+**Step 1.** Open your Claude Desktop config file:
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+**Step 2.** Add this block:
+
+```json
+{
+  "mcpServers": {
+    "srilanka-geo": {
+      "command": "docker",
+      "args": ["exec", "-i", "mcp-srilanka-geo", "python", "-m", "app.main", "stdio"]
+    }
+  }
+}
+```
+
+**Step 3.** Restart Claude Desktop.
+
+You will now see **srilanka-geo** listed as a connected tool. Start asking questions in plain English — Claude will call the right tool automatically.
+
+> Example: *"Find hospitals within 5km of Colombo Fort"*
+
+---
+
+### Option B — Any MCP-compatible agent or platform (SSE, needs API key)
+
+Antigravity, custom AI agents, or any platform that supports MCP over SSE connects to the HTTP endpoint.
+
+**What you need:**
+- The server URL: `https://your-domain.com/sse`
+- An API key (contact the server operator to get one)
+
+**Step 1.** In your agent platform, find the option to add an MCP server. It may be called "Add Tool", "Connect MCP", or "Add Integration".
+
+**Step 2.** Enter:
+
+```
+Transport:  SSE
+URL:        https://your-domain.com/sse
+Header:     X-API-Key: <your-api-key>
+```
+
+**Step 3.** Save. The platform will connect and automatically discover all 12 tools.
+
+That's it. Your agent can now answer location-aware questions about Sri Lanka.
+
+> Example: *"What universities are within 20km of Kandy?"*
+
+---
+
+### Option C — Custom AI agent (developer)
+
+If you are building your own agent using the Anthropic SDK or any MCP client library, connect like this:
+
+```python
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+
+async with sse_client(
+    "https://your-domain.com/sse",
+    headers={"X-API-Key": "your-api-key"}
+) as (read, write):
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        tools = await session.list_tools()  # all 12 tools ready to use
+```
+
+Pass the tools to `claude-opus-4-6` or any Claude model and the agent will call them as needed.
+
+---
+
+### What the user sees vs what happens behind the scenes
+
+The end user never interacts with MCP directly. They just type a question:
+
+```
+User:  "Are there any banks near our new office in Kandy?"
+
+Agent: calls find_nearby(lat=7.2906, lng=80.6337, subcategory="bank", radius_km=2)
+
+User:  "Yes — there are 6 banks within 2km:
+        - Bank of Ceylon (340m)
+        - People's Bank (520m)
+        - HNB (780m) ..."
+```
+
+---
+
+### Getting an API key
+
+SSE connections require an API key. Keys are issued per consumer (one key per application or team). Contact the server operator and provide:
+
+- Your application name
+- Intended use (e.g. BizMind AI, internal tool, research)
+
+Keys must be at least 32 characters. Generate a candidate key to propose:
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+---
+
 ## Transport Modes
 
 | Mode | How it is used | Auth behavior |

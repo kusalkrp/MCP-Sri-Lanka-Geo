@@ -75,16 +75,36 @@ async def find_pois_nearby(
     lng: float,
     radius_m: float,
     category: str | None = None,
+    subcategory: str | None = None,
     limit: int = 20,
 ) -> list[dict]:
     """
     Return POIs within radius_m metres of (lat, lng), ordered by distance.
     Uses geography cast for accurate metre-based distance.
     GIST index on geom(Point,4326) is used via the bounding box pre-filter.
+    subcategory filter is applied after the spatial + category filter.
     """
     pool = get_pool()
     async with pool.acquire() as conn:
-        if category:
+        if category and subcategory:
+            rows = await conn.fetch("""
+                SELECT
+                    id, name, name_si, name_ta, category, subcategory,
+                    ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                    address, tags, wikidata_id, quality_score,
+                    ST_Distance(geom::geography,
+                                ST_MakePoint($2, $1)::geography) AS distance_m
+                FROM pois
+                WHERE deleted_at IS NULL
+                  AND category = $5
+                  AND subcategory = $6
+                  AND ST_DWithin(geom::geography,
+                                 ST_MakePoint($2, $1)::geography,
+                                 $3)
+                ORDER BY distance_m
+                LIMIT $4
+            """, lat, lng, radius_m, limit, category, subcategory)
+        elif category:
             rows = await conn.fetch("""
                 SELECT
                     id, name, name_si, name_ta, category, subcategory,
@@ -101,6 +121,23 @@ async def find_pois_nearby(
                 ORDER BY distance_m
                 LIMIT $4
             """, lat, lng, radius_m, limit, category)
+        elif subcategory:
+            rows = await conn.fetch("""
+                SELECT
+                    id, name, name_si, name_ta, category, subcategory,
+                    ST_Y(geom) AS lat, ST_X(geom) AS lng,
+                    address, tags, wikidata_id, quality_score,
+                    ST_Distance(geom::geography,
+                                ST_MakePoint($2, $1)::geography) AS distance_m
+                FROM pois
+                WHERE deleted_at IS NULL
+                  AND subcategory = $5
+                  AND ST_DWithin(geom::geography,
+                                 ST_MakePoint($2, $1)::geography,
+                                 $3)
+                ORDER BY distance_m
+                LIMIT $4
+            """, lat, lng, radius_m, limit, subcategory)
         else:
             rows = await conn.fetch("""
                 SELECT
@@ -413,7 +450,7 @@ async def get_spatial_candidates(
     lng: float,
     radius_m: float,
     category: str | None,
-    max_candidates: int = 200,
+    max_candidates: int = 500,
 ) -> list[dict]:
     """
     Return up to max_candidates POI IDs + distances for hybrid search pre-filter.
