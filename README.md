@@ -1,8 +1,133 @@
 # MCP Sri Lanka Geo
 
-Production-grade Model Context Protocol (MCP) server for Sri Lanka geospatial search. It exposes Sri Lanka Points of Interest (POIs) as structured MCP tools backed by PostGIS, Qdrant, Redis, and Gemini embeddings.
+Production-grade Model Context Protocol (MCP) server for Sri Lanka geospatial search. It exposes 50,000+ Sri Lanka Points of Interest (POIs) as 12 structured MCP tools backed by PostGIS, Qdrant, Redis, and Gemini embeddings.
 
-The repository is designed for LLM clients that need location-aware retrieval over Sri Lankan administrative areas, nearby POIs, commercial entities, universities, agricultural zones, and hybrid semantic search.
+Any AI agent or LLM client that supports MCP connects once and can immediately answer location-aware questions about Sri Lanka — no custom integration, no geospatial expertise required.
+
+## Who This Is For
+
+**Developers building Sri Lanka apps** — get spatial search, semantic POI lookup, and administrative boundary data without building your own geospatial backend.
+
+**AI agent products** — BizMind AI, EduIntel LK, and AgroMind AI use this to answer questions like *"what businesses are near this address?"*, *"find universities within 20km of Kandy"*, or *"what agricultural zones are near this site?"*
+
+**Business and site analysts** — answer commercial density, proximity, and coverage questions instantly: *"how many banks and pharmacies are within 2km of this Colombo location?"*
+
+**Real estate and property teams** — evaluate any Sri Lanka location by what's nearby: hospitals, schools, shops, transport, government offices.
+
+**NGOs and government agencies** — assess service coverage across districts and provinces, including sparse post-conflict areas in the Northern and Eastern Provinces where data gaps are handled explicitly.
+
+**Tourism and travel platforms** — combine semantic search with spatial filtering: *"Buddhist temples with historical significance near Kandy"* works out of the box.
+
+**Not useful for:** users outside Sri Lanka, real-time business data (dataset refreshes monthly from OSM), turn-by-turn road routing, or high-precision address lookup in rural areas.
+
+---
+
+## The Dataset
+
+The dataset is built from three sources merged into a single PostGIS table:
+
+| Source | Role | Coverage |
+|---|---|---|
+| OpenStreetMap (Geofabrik Sri Lanka extract) | Primary — all POIs, coordinates, tags | 50,514 active POIs |
+| Wikidata REST API | Enrichment — descriptions, images, aliases | 415 POIs (0.8%) |
+| GeoNames LK dump | Cross-reference — alternate names, feature codes | 5,846 POIs (11.6%) |
+
+### POIs by category
+
+| Category | Total POIs | Top subcategories |
+|---|---|---|
+| `amenity` | 22,473 | place_of_worship (6,367), school (3,732), restaurant (2,338), bank (2,025), hospital (739) |
+| `shop` | 6,749 | supermarket (987), convenience, hardware, clothes |
+| `landuse` | 6,633 | farmland (3,617), reservoir, orchard |
+| `tourism` | 4,986 | hotel (2,521), guest_house (1,529), attraction |
+| `natural` | 3,374 | water (2,370), tree, cliff |
+| `office` | 2,763 | government (1,279), educational_institution (246) |
+| `public_transport` | 1,292 | platform (607), stop_position |
+| `leisure` | 1,265 | park, sports_centre, pitch |
+| `historic` | 440 | ruins, monument, archaeological_site |
+
+### POIs by province
+
+| Province | POIs | Notes |
+|---|---|---|
+| Western Province | 14,148 | Colombo district alone: 8,509 |
+| Eastern Province | 6,451 | Batticaloa (3,175), Ampara (2,163) |
+| Southern Province | 6,344 | Galle (3,240), Matara (1,714) |
+| Central Province | 5,904 | Kandy (3,073) |
+| Northern Province | 5,411 | Jaffna (2,582); lower quality threshold applied for sparse districts |
+| North Western Province | 4,378 | Kurunegala (3,185) |
+| Uva Province | 3,108 | |
+| Sabaragamuwa Province | 2,495 | |
+| North Central Province | 2,275 | Anuradhapura (1,767) |
+
+### Field coverage
+
+| Field | Populated | Notes |
+|---|---|---|
+| `name` (English) | 100% | Required for ingestion |
+| `name_si` (Sinhala) | 0.8% (384) | OSM contributor coverage is low outside major cities |
+| `name_ta` (Tamil) | 2.7% (1,361) | Higher in Northern and Eastern Provinces |
+| `address.district` | 100% | Assigned via PostGIS ST_Contains against GADM boundaries |
+| `phone` | 5.0% (2,545) | Normalised to E.164 format (+94XXXXXXXXX) |
+| `website` | 2.8% (1,412) | Normalised to https://, no trailing slash |
+| `opening_hours` | 3.9% (1,978) | Raw OSM format (e.g. `Mo-Su 09:00-21:00`) |
+| `wikidata_id` | 0.8% (415) | Mostly major landmarks, government buildings |
+| `geonames_id` | 11.6% (5,846) | Named geographic features, towns, rivers |
+
+**Refresh cycle:** The scheduler re-downloads the Sri Lanka PBF from Geofabrik every 7 days (configurable via `PIPELINE_SCHEDULE_DAYS`), runs the full 13-step pipeline, and updates only changed records.
+
+---
+
+## Known Limitations
+
+**No road routing.** `route_between` returns straight-line (as-the-crow-flies) distance and compass bearing only. It does not calculate drive time or road distance. For road routing, use a separate service such as OSRM or Google Maps and pass the coordinates returned by this MCP.
+
+**Monthly data refresh.** The dataset is rebuilt from OpenStreetMap monthly. A newly opened business, a recently closed hospital, or a renamed road will not appear until the next pipeline run. This makes the dataset suitable for planning and analysis, not real-time operational lookup.
+
+**OSM data quality varies by region.** Western Province (especially Colombo) has dense, well-maintained OSM coverage. Rural districts in Uva, Sabaragamuwa, and parts of the Northern and Eastern Provinces have genuine data gaps — fewer POIs, less complete address data, lower Sinhala/Tamil name coverage. This is a property of the source data, not a bug.
+
+**Sparse province handling.** Kilinochchi, Mullaitivu, Mannar, and Vavuniya (post-conflict Northern Province) have a lowered quality threshold (0.20 vs 0.30 nationally) to avoid excluding the only hospital or school in an area. Some lower-quality records in these districts are intentional.
+
+**Contact data is incomplete.** Only 5% of POIs have a phone number and 2.8% have a website. These come from OSM contributors — they are not scraped or verified. A POI listing without a phone number simply means no contributor has added one to OSM, not that the business has no phone.
+
+**Opening hours are not structured.** The `opening_hours` field stores the raw OSM value (e.g. `Mo-Fr 08:00-17:00; Sa 08:00-13:00`). It is not parsed into structured time windows. Agents that need to check if a place is open right now must parse this format themselves.
+
+**No custom POIs.** The dataset is sourced entirely from OpenStreetMap. There is no mechanism to add a private POI that does not exist in OSM. To add a missing place permanently, contribute it to OpenStreetMap — it will appear in this dataset on the next monthly sync.
+
+**Coordinate precision.** POI coordinates come from OSM. For ways and relations (buildings, land parcels), the coordinate is the geometric centroid, which may not match the physical entrance.
+
+---
+
+## FAQ
+
+**How do I get a POI added or corrected?**
+Edit OpenStreetMap at [openstreetmap.org](https://www.openstreetmap.org). The next monthly pipeline run will pick up the change. For urgent corrections in your own deployment, you can run `scripts/run_pipeline.py` manually or trigger it via `POST /pipeline/trigger`.
+
+**Why is a place I know missing from results?**
+Either it is not in OpenStreetMap yet, it was added after the last pipeline run, or its quality score fell below the inclusion threshold (0.30 nationally, 0.20 for sparse Northern/Eastern Province districts). Check OpenStreetMap directly to confirm whether the place exists in the source data.
+
+**What does `quality_score` mean?**
+A completeness score between 0 and 1 computed at ingest time. It rewards having a name, Sinhala/Tamil translations, an address, phone, website, opening hours, and a specific subcategory. It is used to filter out skeleton records (an OSM node with just a coordinate and no useful metadata) and to break ties when deduplicating. It does not indicate business quality or popularity.
+
+**How often is the data updated?**
+Every 7 days by default (set by `PIPELINE_SCHEDULE_DAYS` in `.env`). The scheduler checks Geofabrik's MD5 checksum — if the PBF file has not changed since the last run, it skips the download. You can trigger an immediate run via `POST /pipeline/trigger` without waiting for the schedule.
+
+**Can I use this for a non-Sri Lanka dataset?**
+The coordinate validation, admin boundary data, and pipeline scripts are all Sri Lanka-specific. The architecture (PostGIS + Qdrant + Redis + FastMCP) is general-purpose, but adapting it to another country requires new boundary data, a different PBF extract, retuned quality thresholds, and updated category mappings.
+
+**Why does `search_pois` sometimes return fewer results than `find_nearby`?**
+`search_pois` uses a two-stage pipeline: PostGIS spatial pre-filter (up to 500 candidates) followed by Qdrant semantic reranking. The final result is limited to the top `limit` results by semantic score. `find_nearby` returns all POIs within the radius up to `limit`, sorted by distance only. If you need exhaustive radius results, use `find_nearby`. If you need semantic relevance ranking, use `search_pois`.
+
+**What happens if Redis goes down?**
+The server continues to function. Redis is a performance dependency, not a functional one. Tool responses take longer (every request hits PostGIS or Qdrant directly) but return correct results. The `/health` endpoint reports Redis as `degraded` rather than `error` in this state.
+
+**Can I add my own API key without contacting the operator?**
+Yes. `POST /keys/register` with your app name and contact email returns a 64-character API key immediately. No approval required. The key is shown once — store it securely.
+
+**What is the difference between `find_nearby` and `find_businesses_near`?**
+`find_nearby` searches all POI categories and accepts `category` and `subcategory` filters. `find_businesses_near` is pre-filtered to commercial entities only (shops, offices, commercial amenities) and accepts a `business_type` parameter. Use `find_businesses_near` when you specifically want commercial results; use `find_nearby` for general proximity search across all categories.
+
+---
 
 ## Overview
 
