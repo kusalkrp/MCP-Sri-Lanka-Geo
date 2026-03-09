@@ -103,17 +103,23 @@ flowchart TB
     App --> PG[(postgres container)]
     App --> Q[(qdrant container)]
     App --> R[(redis container)]
+    Scheduler[scheduler container] --> PG
+    Scheduler --> Q
+    Scheduler --> R
+    Scheduler --> Geofabrik[Geofabrik OSM download]
+    Scheduler --> GeminiAPI[Gemini Embedding API]
 
     subgraph Docker Compose
         Caddy
         App
+        Scheduler
         PG
         Q
         R
     end
 ```
 
-In development, [docker-compose.yml](/g:/MCP-Sri-Lanka-Geo/docker-compose.yml) exposes `8080`, `5433`, `6333`, `6334`, and `6379`. In production, [docker-compose.prod.yml](/g:/MCP-Sri-Lanka-Geo/docker-compose.prod.yml) removes direct exposure for Postgres, Qdrant, and Redis, binds the app to `127.0.0.1:8080`, and adds Caddy for TLS termination.
+In development, [docker-compose.yml](/g:/MCP-Sri-Lanka-Geo/docker-compose.yml) exposes `8080`, `5433`, `6333`, `6334`, and `6379`. In production, [docker-compose.prod.yml](/g:/MCP-Sri-Lanka-Geo/docker-compose.prod.yml) removes direct exposure for Postgres, Qdrant, and Redis, binds the app to `127.0.0.1:8080`, and adds Caddy for TLS termination. The scheduler container runs the data pipeline on a configurable schedule and is never exposed to the network.
 
 ## Repository Structure
 
