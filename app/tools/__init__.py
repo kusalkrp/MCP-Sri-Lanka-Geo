@@ -64,6 +64,7 @@ def register_tools(mcp: FastMCP) -> None:
         lng: float,
         radius_km: float = 5.0,
         category: str | None = None,
+        subcategory: str | None = None,
         limit: int = 20,
     ) -> dict:
         """
@@ -74,6 +75,8 @@ def register_tools(mcp: FastMCP) -> None:
             lng: Longitude (79.5 – 81.9)
             radius_km: Search radius in kilometres (default 5, max 100)
             category: Filter by OSM category (e.g. 'amenity', 'shop', 'tourism')
+            subcategory: Filter by OSM subcategory (e.g. 'hospital', 'bank', 'restaurant').
+                         Can be used with or without category.
             limit: Max results to return (default 20, max 100)
 
         Returns:
@@ -90,23 +93,23 @@ def register_tools(mcp: FastMCP) -> None:
             limit = min(int(limit), 100)
             radius_m = radius_km * 1000.0
 
-            key = redis_cache.spatial_key(lat, lng, radius_km, category) + f":{limit}"
+            key = redis_cache.spatial_key(lat, lng, radius_km, category) + f":{subcategory or 'all'}:{limit}"
 
             async def fetch():
-                rows = await postgis.find_pois_nearby(lat, lng, radius_m, category, limit)
+                rows = await postgis.find_pois_nearby(lat, lng, radius_m, category, subcategory, limit)
                 return {
                     "total": len(rows),
                     "results": [
                         {
-                            "id":           r["id"],
-                            "name":         r["name"],
-                            "name_si":      r["name_si"],
-                            "category":     r["category"],
-                            "subcategory":  r["subcategory"],
-                            "lat":          r["lat"],
-                            "lng":          r["lng"],
-                            "distance_m":   round(r["distance_m"], 1),
-                            "address":      r["address"],
+                            "id":            r["id"],
+                            "name":          r["name"],
+                            "name_si":       r["name_si"],
+                            "category":      r["category"],
+                            "subcategory":   r["subcategory"],
+                            "lat":           r["lat"],
+                            "lng":           r["lng"],
+                            "distance_m":    round(r["distance_m"], 1),
+                            "address":       r["address"],
                             "quality_score": r["quality_score"],
                         }
                         for r in rows
@@ -117,7 +120,8 @@ def register_tools(mcp: FastMCP) -> None:
             log.info("tool_called", tool="find_nearby",
                      duration_ms=round((time.time() - t) * 1000),
                      result_count=result.get("total", 0),
-                     cache_hit=cache_hit)
+                     cache_hit=cache_hit,
+                     subcategory=subcategory)
             return result
 
         except Exception as exc:
@@ -348,7 +352,7 @@ def register_tools(mcp: FastMCP) -> None:
 
             if lat is not None and lng is not None:
                 candidates = await postgis.get_spatial_candidates(
-                    lat, lng, radius_m, category, max_candidates=200
+                    lat, lng, radius_m, category, max_candidates=500
                 )
                 # CRITICAL: 0 results in radius → return empty immediately
                 # Never fall through to unconstrained Qdrant search

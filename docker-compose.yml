@@ -80,6 +80,23 @@ services:
       retries: 5
     restart: unless-stopped
 
+  scheduler:
+    build: .
+    container_name: srilanka-geo-scheduler
+    command: python scripts/scheduler.py
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data          # writable — scheduler downloads PBF here
+      - ./backups:/app/backups    # backups written here
+
 volumes:
   postgres_data:
   qdrant_data:
