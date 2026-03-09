@@ -31,6 +31,31 @@ HTTP 401
 {"detail": "Invalid or missing API key"}
 ```
 
+### How to get an API key
+
+Register instantly — no approval required:
+
+```bash
+curl -X POST https://your-domain.com/keys/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "app_name": "MyApp",
+    "contact":  "you@example.com",
+    "use_case": "Building a location-aware chatbot"
+  }'
+```
+
+Response (key shown **once only** — save it immediately):
+```json
+{
+  "api_key":  "51946848e97a9fe5aab70e6cfbe8269f...",
+  "prefix":   "51946848e97a9fe5",
+  "app_name": "MyApp",
+  "warning":  "Save this key now — it will never be shown again.",
+  "usage":    "Add header  X-API-Key: <your-key>  to every request."
+}
+```
+
 ### stdio Transport
 
 No authentication required. The stdio transport is for local clients (Claude Desktop, Claude Code) running as the same OS user.
@@ -106,6 +131,93 @@ Post MCP JSON-RPC messages to an active SSE session.
 **Response 202:** Message accepted.
 **Response 410:** SSE session closed.
 **Response 413:** Request body > 1MB.
+
+---
+
+### `POST /keys/register`
+
+Register a new API key instantly. No approval required.
+
+**Auth:** None — public endpoint.
+
+**Request body:**
+```json
+{
+  "app_name": "MyApp",
+  "contact":  "you@example.com",
+  "use_case": "Optional description of what you're building"
+}
+```
+
+| Field | Required | Max length | Description |
+|---|---|---|---|
+| `app_name` | Yes | 100 chars | Name of your application |
+| `contact` | Yes | 200 chars | Your email or name |
+| `use_case` | No | — | What you're building |
+
+**Response 201:**
+```json
+{
+  "api_key":  "51946848e97a9fe5aab70e6cfbe8269f842594b4f81a92e0043d8097c839a82d",
+  "prefix":   "51946848e97a9fe5",
+  "app_name": "MyApp",
+  "warning":  "Save this key now — it will never be shown again.",
+  "usage":    "Add header  X-API-Key: <your-key>  to every request."
+}
+```
+
+**Important:** The full `api_key` is returned exactly once. It is never stored in plaintext — only its SHA-256 hash is kept. If you lose it, register a new one.
+
+**Response 400:** `app_name` or `contact` missing or empty.
+
+---
+
+### `GET /admin/keys`
+
+List all registered API keys with usage stats.
+
+**Auth:** `X-Admin-Key: <admin-key>` header required.
+
+**Response 200:**
+```json
+{
+  "total": 3,
+  "keys": [
+    {
+      "id":            1,
+      "key_prefix":    "51946848e97a9fe5...",
+      "app_name":      "BizMind AI",
+      "contact":       "dev@bizmind.lk",
+      "use_case":      "Location-aware business intelligence",
+      "created_at":    "2026-03-09T07:18:14.483822+00:00",
+      "last_used_at":  "2026-03-09T10:41:00.000000+00:00",
+      "revoked_at":    null,
+      "request_count": 1482,
+      "status":        "active"
+    }
+  ]
+}
+```
+
+**Response 401:** Invalid or missing `X-Admin-Key`.
+
+---
+
+### `DELETE /admin/keys/{key_id}`
+
+Revoke an API key by its numeric ID. Revocation is immediate — the key stops working on the next request.
+
+**Auth:** `X-Admin-Key: <admin-key>` header required.
+
+**Path param:** `key_id` — the `id` field from `GET /admin/keys`.
+
+**Response 200:**
+```json
+{ "revoked": true, "key_id": 3 }
+```
+
+**Response 404:** Key not found or already revoked.
+**Response 401:** Invalid or missing `X-Admin-Key`.
 
 ---
 

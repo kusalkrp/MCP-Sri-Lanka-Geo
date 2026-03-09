@@ -433,16 +433,42 @@ User:  "Yes — there are 6 banks within 2km:
 
 ### Getting an API key
 
-SSE connections require an API key. Keys are issued per consumer (one key per application or team). Contact the server operator and provide:
-
-- Your application name
-- Intended use (e.g. BizMind AI, internal tool, research)
-
-Keys must be at least 32 characters. Generate a candidate key to propose:
+SSE connections require an API key. Register instantly — no approval, no waiting:
 
 ```bash
-python -c "import secrets; print(secrets.token_hex(32))"
+curl -X POST https://your-domain.com/keys/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "app_name": "MyApp",
+    "contact":  "you@example.com",
+    "use_case": "Building a location-aware chatbot"
+  }'
 ```
+
+```json
+{
+  "api_key":  "51946848e97a9fe5aab70e6cfbe8269f842594b4f81a92e0043d8097c839a82d",
+  "prefix":   "51946848e97a9fe5",
+  "warning":  "Save this key now — it will never be shown again.",
+  "usage":    "Add header  X-API-Key: <your-key>  to every request."
+}
+```
+
+Save the `api_key` immediately — it is shown once and never stored in plaintext.
+
+### Revoking a key (admin only)
+
+```bash
+# List all keys and their IDs
+curl https://your-domain.com/admin/keys \
+  -H "X-Admin-Key: <admin-key>"
+
+# Revoke by ID — takes effect immediately
+curl -X DELETE https://your-domain.com/admin/keys/3 \
+  -H "X-Admin-Key: <admin-key>"
+```
+
+The admin key is set via `ADMIN_KEY` in `.env` and is separate from regular API keys.
 
 ---
 
@@ -480,8 +506,9 @@ Settings are loaded through [app/config.py](/g:/MCP-Sri-Lanka-Geo/app/config.py)
 | `QDRANT_COLLECTION` | Collection name, defaults to `srilanka_pois` |
 | `REDIS_URL` | Redis connection string |
 | `GEMINI_API_KEY` | Gemini embedding key |
-| `API_KEYS` | Comma-separated SSE API keys |
+| `API_KEYS` | Comma-separated SSE API keys for existing consumers (.env-managed) |
 | `REQUIRE_AUTH` | Validation flag for configured auth expectations |
+| `ADMIN_KEY` | Key for `/admin/keys` endpoints (list, revoke) — min 32 chars |
 | `APP_VERSION` | Runtime version string |
 
 ## Testing
