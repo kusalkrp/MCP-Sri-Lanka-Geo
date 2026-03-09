@@ -168,7 +168,65 @@ backfill_validation: district_coverage_pct=100.0, missing_district=0, total_pois
 spatial_backfill_complete: contains_updated=50183, duration_sec=3.8
 ```
 
-### Step 6: Wikidata Enrichment
+### Step 6: Data Cleaning
+
+**What it does:**
+
+Runs `scripts/clean_dataset.py` over all active POIs and normalises four classes of dirty data identified by analysis of the actual Sri Lanka OSM extract:
+
+| Operation | Records affected (first run) | Detail |
+|---|---|---|
+| Phone normalisation | 1,679 of 2,545 | Unifies 4 observed formats (`+94 xx xx`, `0094...`, `07...`, semicolon-separated multiples) to E.164: `+94XXXXXXXXX` |
+| Website normalisation | 1,077 of 1,412 | Upgrades `http://` to `https://`, strips trailing slashes, adds missing scheme |
+| Postcode validation | 54 of 1,659 | Zero-pads short numeric values (e.g. `4000` → `04000`); nulls out non-numeric junk (`Harankahawa`, `004000`, `0094`) |
+| Name title-casing | 306 of 50,516 | Converts ALL-CAPS multi-word names and long single-word names to title case (e.g. `ULLAI POST OFFICE` → `Ullai Post Office`); preserves known acronyms (`BOC`, `HNB`, `ATM`, etc.) |
+| Coordinate duplicate removal | 2 soft-deleted | Finds POIs sharing exact coordinates with identical names; keeps the higher-quality record |
+
+**Why after spatial backfill:**
+The cleaning step runs after spatial backfill because district/province must be set before enrichment and embedding. It runs before Wikidata enrichment so that cleaned names are used when fetching Wikidata descriptions.
+
+**Name changes and re-embedding:**
+Name changes set `updated_at = NOW()`. The embedding step (`generate_embeddings.py`) detects this and re-embeds all affected POIs automatically — no manual intervention needed.
+
+**Idempotent:**
+The script is safe to re-run. It reads current values, computes the normalised form, and only writes if there is a change. Running it twice produces no additional updates.
+
+**Command:**
+```bash
+docker exec mcp-srilanka-geo bash -c "cd /app && python scripts/clean_dataset.py"
+
+# Dry run — prints what would change without writing:
+docker exec mcp-srilanka-geo bash -c "cd /app && python scripts/clean_dataset.py --dry-run"
+```
+
+**Expected output:**
+```
+clean_dataset_start: dry_run=False
+clean_phones_planned: changes=1679
+clean_websites_planned: changes=1077
+clean_postcodes_planned: fix=38 nulled=16
+clean_names_planned: changes=306
+clean_coord_dupes_planned: to_delete=2
+clean_dataset_complete:
+  phones   = {checked: 2545, changed: 1679}
+  websites = {checked: 1412, changed: 1077}
+  postcodes= {checked: 1659, fixed: 38, nulled: 16}
+  names    = {checked: 50516, changed: 306}
+  coord_duplicates = {duplicate_groups: 3, soft_deleted: 2}
+
+Cleaning complete. Summary:
+  Phones normalised:    1679 / 2545
+  Websites normalised:  1077 / 1412
+  Postcodes fixed:      38 fixed, 16 removed
+  Names title-cased:    306 / 50516
+  Coord dupes removed:  2 soft-deleted
+```
+
+**On subsequent runs** (incremental pipeline after a monthly PBF refresh), only newly ingested or changed POIs will have dirty values — the changed count will be much smaller than the first-run numbers above.
+
+---
+
+### Step 7: Wikidata Enrichment
 
 **What it does:**
 - Finds all POIs with a `wikidata_id` tag (~415 POIs)
@@ -191,7 +249,7 @@ wikidata_enrich_start: total=415, full=False
 wikidata_enrich_complete: enriched=414, not_found=1, total=415, duration_sec=16.6
 ```
 
-### Step 7: GeoNames Enrichment
+### Step 8: GeoNames Enrichment
 
 **What it does:**
 - Loads all 56,995 Sri Lanka GeoNames entries (LK.txt)
@@ -220,7 +278,7 @@ geonames_enrich_complete: matched=5847, total=50516, match_rate_pct=11.6, durati
 - GeoNames covers major named features; OSM covers local shops, clinics, schools
 - Tier 2 (coordinate-only) catches Sinhala-named POIs at the same location as English GeoNames entries
 
-### Step 8: Generate Gemini Embeddings
+### Step 9: Generate Gemini Embeddings
 
 **What it does:**
 - Finds all POIs where `last_embed_sync IS NULL OR last_embed_sync < updated_at`
@@ -253,7 +311,7 @@ embedding_complete: embedded=50276, failed=0, total=50276, duration_min=33.2
 - text-embedding-004: ~$0.000001/token → ~$0.75 for initial run
 - Monthly incremental (5% change): ~$0.04
 
-### Step 9: Refresh Category Stats
+### Step 10: Refresh Category Stats
 
 **What it does:**
 - Truncates and recomputes the `category_stats` table
@@ -271,7 +329,7 @@ category_stats_refresh_start
 category_stats_refresh_complete: rows=3898, duration_sec=2.1
 ```
 
-### Step 10: Validate Dataset
+### Step 11: Validate Dataset
 
 **What it does:**
 - Checks POI count (must be > 40,000 active)
@@ -296,7 +354,7 @@ validate_category_stats: rows=3898 ✓
 validation_complete: status=pass
 ```
 
-### Step 11: Reconcile Qdrant
+### Step 12: Reconcile Qdrant
 
 **What it does:**
 - Samples 1% of PostGIS `qdrant_id` values and verifies they exist in Qdrant
@@ -314,7 +372,7 @@ reconcile_start: sample_size=505 (1% of 50516)
 reconcile_complete: checked=505, missing=0
 ```
 
-### Step 12: Invalidate Redis Cache
+### Step 13: Invalidate Redis Cache
 
 **What it does:**
 - Finds all POIs changed since a given timestamp (or last pipeline run)
@@ -347,6 +405,7 @@ docker exec mcp-srilanka-geo bash -c "cd /app && \
     --level2 data/gadm41_LKA_2.json && \
   python scripts/ingest_osm.py --pbf data/sri-lanka-latest.osm.pbf && \
   python scripts/spatial_backfill.py && \
+  python scripts/clean_dataset.py && \
   python scripts/enrich_wikidata.py && \
   python scripts/enrich_geonames.py --geonames /tmp/LK.txt && \
   python scripts/generate_embeddings.py && \

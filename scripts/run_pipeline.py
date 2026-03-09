@@ -40,13 +40,14 @@ Steps (canonical order from CLAUDE.md):
     3.  Load admin boundaries
     4.  OSM ingest -> PostGIS (skip-embeddings)
     5.  Spatial backfill (district/province)
-    6.  Wikidata enrichment (incremental)
-    7.  GeoNames enrichment
-    8.  Generate embeddings -> Qdrant
-    9.  Refresh category_stats
-    10. Flush Redis cache
-    11. Validate dataset
-    12. Reconcile Qdrant
+    6.  Data cleaning                           (phone/URL/postcode/name normalisation)
+    7.  Wikidata enrichment (incremental)
+    8.  GeoNames enrichment
+    9.  Generate embeddings -> Qdrant
+    10. Refresh category_stats
+    11. Flush Redis cache
+    12. Validate dataset
+    13. Reconcile Qdrant
 """
 
 from __future__ import annotations
@@ -153,7 +154,7 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     dry_run       = args.dry_run
     skip_embed    = args.skip_embeddings
     resume_from   = args.resume_from or 1
-    total_steps   = 12
+    total_steps   = 13
 
     started_at = datetime.now(timezone.utc)
     print(f"\nmcp-srilanka-geo pipeline starting at {started_at.isoformat()}")
@@ -298,9 +299,24 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         print(f"  Spatial backfill completed in {time.time()-t0:.1f}s")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEP 6 — Wikidata enrichment
+    # STEP 6 — Data cleaning
     # ──────────────────────────────────────────────────────────────────────────
     step = 6
+    _banner(step, total_steps, "Data cleaning (phone / URL / postcode / name normalisation)")
+    if step < resume_from:
+        print("  [skipped — resuming from later step]")
+    else:
+        t0 = time.time()
+        rc = _run([sys.executable, str(ROOT / "scripts" / "clean_dataset.py")], dry_run)
+        if rc != 0:
+            print(f"  WARNING: clean_dataset.py exited {rc} — continuing anyway")
+        else:
+            print(f"  Data cleaning completed in {time.time()-t0:.1f}s")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # STEP 7 — Wikidata enrichment
+    # ──────────────────────────────────────────────────────────────────────────
+    step = 7
     _banner(step, total_steps, "Wikidata enrichment (incremental)")
     if step < resume_from:
         print("  [skipped — resuming from later step]")
@@ -318,9 +334,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             print(f"  Wikidata enrichment completed in {time.time()-t0:.1f}s")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEP 7 — GeoNames enrichment
+    # STEP 8 — GeoNames enrichment
     # ──────────────────────────────────────────────────────────────────────────
-    step = 7
+    step = 8
     _banner(step, total_steps, "GeoNames enrichment")
     if step < resume_from:
         print("  [skipped — resuming from later step]")
@@ -341,9 +357,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             print(f"  GeoNames enrichment completed in {time.time()-t0:.1f}s")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEP 8 — Generate embeddings -> Qdrant
+    # STEP 9 — Generate embeddings -> Qdrant
     # ──────────────────────────────────────────────────────────────────────────
-    step = 8
+    step = 9
     _banner(step, total_steps, "Generate embeddings -> Qdrant")
     if step < resume_from:
         print("  [skipped — resuming from later step]")
@@ -359,9 +375,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         print(f"  Embeddings completed in {time.time()-t0:.1f}s")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEP 9 — Refresh category_stats
+    # STEP 10 — Refresh category_stats
     # ──────────────────────────────────────────────────────────────────────────
-    step = 9
+    step = 10
     _banner(step, total_steps, "Refresh category_stats")
     if step < resume_from:
         print("  [skipped — resuming from later step]")
@@ -374,9 +390,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         print(f"  category_stats refreshed in {time.time()-t0:.1f}s")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEP 10 — Flush Redis cache
+    # STEP 11 — Flush Redis cache
     # ──────────────────────────────────────────────────────────────────────────
-    step = 10
+    step = 11
     _banner(step, total_steps, "Flush Redis cache (changed POIs)")
     if step < resume_from:
         print("  [skipped — resuming from later step]")
@@ -390,9 +406,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
             print(f"  Redis cache flushed in {time.time()-t0:.1f}s")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEP 11 — Validate dataset
+    # STEP 12 — Validate dataset
     # ──────────────────────────────────────────────────────────────────────────
-    step = 11
+    step = 12
     _banner(step, total_steps, "Validate dataset")
     if step < resume_from:
         print("  [skipped — resuming from later step]")
@@ -405,9 +421,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
         print(f"  Validation passed in {time.time()-t0:.1f}s")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # STEP 12 — Reconcile Qdrant
+    # STEP 13 — Reconcile Qdrant
     # ──────────────────────────────────────────────────────────────────────────
-    step = 12
+    step = 13
     _banner(step, total_steps, "Reconcile PostGIS <-> Qdrant")
     if step < resume_from:
         print("  [skipped — resuming from later step]")

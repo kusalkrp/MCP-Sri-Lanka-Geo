@@ -501,14 +501,15 @@ flowchart TD
     A[Download OSM PBF + boundaries] --> B[Load admin boundaries]
     B --> C[Ingest OSM into PostGIS]
     C --> D[Spatial backfill for district/province]
-    D --> E[Wikidata enrichment]
-    E --> F[GeoNames enrichment]
-    F --> G[Generate Gemini embeddings]
-    G --> H[Upsert vectors into Qdrant]
-    H --> I[Refresh category_stats]
-    I --> J[Validate dataset]
-    J --> K[Reconcile Qdrant]
-    K --> L[Invalidate stale cache]
+    D --> E[Data cleaning: phone / URL / postcode / name]
+    E --> F[Wikidata enrichment]
+    F --> G[GeoNames enrichment]
+    G --> H[Generate Gemini embeddings]
+    H --> I[Upsert vectors into Qdrant]
+    I --> J[Refresh category_stats]
+    J --> K[Validate dataset]
+    K --> L[Reconcile Qdrant]
+    L --> M[Invalidate stale cache]
 ```
 
 ### Script Inventory
@@ -518,6 +519,7 @@ flowchart TD
 | `scripts/load_admin_boundaries.py` | Load GADM GeoJSON into `admin_boundaries` |
 | `scripts/ingest_osm.py` | Parse OSM PBF and upsert POIs into PostGIS |
 | `scripts/spatial_backfill.py` | Backfill district and province assignments |
+| `scripts/clean_dataset.py` | Normalise phones, URLs, postcodes; fix ALL-CAPS names; remove coordinate duplicates |
 | `scripts/enrich_wikidata.py` | Add Wikidata metadata |
 | `scripts/enrich_geonames.py` | Match POIs with GeoNames records |
 | `scripts/generate_embeddings.py` | Generate embeddings and populate Qdrant |
